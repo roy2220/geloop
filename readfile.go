@@ -18,7 +18,7 @@ type ReadFileRequest struct {
 	// The deadline of the request.
 	Deadline time.Time
 
-	// The function called when data is received.
+	// The function called when there is data received.
 	//
 	// @param request
 	//     The request bound to.
@@ -59,15 +59,13 @@ type ReadFileRequest struct {
 func (l *Loop) ReadFile(request1 *ReadFileRequest) uint64 {
 	request1.r.OnTask = func(r *request) bool {
 		r1 := getReadFileRequest(r)
-		l := r1.r.Loop()
 
-		if err := l.addWatch(&r1.r, r1.FD, poller.EventReadable); err != nil {
-			r1.Callback(r1, err, nil, nil)
+		if isCompleted := r1.process(); isCompleted {
 			return true
 		}
 
 		if !r1.Deadline.IsZero() {
-			l.addAlarm(&r1.r, r1.Deadline)
+			r1.r.Loop().addAlarm(&r1.r, r1.Deadline)
 		}
 
 		return false
@@ -75,7 +73,7 @@ func (l *Loop) ReadFile(request1 *ReadFileRequest) uint64 {
 
 	request1.r.OnWatch = func(r *request) bool {
 		r1 := getReadFileRequest(r)
-		return r1.onWatch()
+		return r1.process()
 	}
 
 	request1.r.OnAlarm = func(r *request) bool {
@@ -104,7 +102,7 @@ func getReadFileRequest(r *request) *ReadFileRequest {
 	return (*ReadFileRequest)(unsafe.Pointer(uintptr(unsafe.Pointer(r)) - unsafe.Offsetof(ReadFileRequest{}.r)))
 }
 
-func (r *ReadFileRequest) onWatch() bool {
+func (r *ReadFileRequest) process() bool {
 	l := r.r.Loop()
 	preBuffer := l.readBuffer[:len(l.readBuffer)/2]
 	buffer := l.readBuffer[len(preBuffer):]
@@ -113,37 +111,46 @@ func (r *ReadFileRequest) onWatch() bool {
 	for {
 		n, err := syscall.Read(r.FD, buffer[i:])
 
-		if err != nil {
+		if err != nil || n == 0 {
 			switch err {
 			case syscall.EINTR:
 				continue
 			case syscall.EAGAIN:
-				needMoreData := r.Callback(r, nil, buffer[:i], preBuffer)
+				var needMoreData bool
+
+				if i == 0 {
+					needMoreData = true
+				} else {
+					needMoreData = r.Callback(r, nil, buffer[:i], preBuffer)
+				}
 
 				if needMoreData {
-					l.addWatch(&r.r, r.FD, poller.EventReadable)
+					if err := l.addWatch(&r.r, r.FD, poller.EventReadable); err != nil {
+						r.Callback(r, err, nil, nil)
+						return true
+					}
+
 					return false
 				}
 
 				return true
 			default:
-				r.Callback(r, err, buffer[:i], preBuffer)
+				if err == nil {
+					err = ErrNoMoreData
+				}
+
+				if i == 0 {
+					r.Callback(r, err, nil, nil)
+				} else {
+					needMoreData := r.Callback(r, nil, buffer[:i], preBuffer)
+
+					if needMoreData {
+						r.Callback(r, err, nil, nil)
+					}
+				}
+
 				return true
 			}
-		}
-
-		if n == 0 {
-			if i == 0 {
-				r.Callback(r, ErrNoMoreData, nil, preBuffer)
-			} else {
-				needMoreData := r.Callback(r, ErrNoMoreData, buffer[:i], preBuffer)
-
-				if needMoreData {
-					r.Callback(r, ErrNoMoreData, nil, preBuffer)
-				}
-			}
-
-			return true
 		}
 
 		i += n

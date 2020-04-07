@@ -18,16 +18,13 @@ type WriteFileRequest struct {
 	// The deadline of the request.
 	Deadline time.Time
 
-	// The function called when the file is ready to write.
+	// The function called before sending data.
 	//
 	// @param request
 	//     The request bound to.
 	//
 	// @param err
 	//     ErrClosed - when the loop is closed;
-	//     ErrFileNotAttached - when the file is not attached;
-	//     ErrFileDetached - when the file is detached;
-	//     ErrDeadlineReached - when the deadline is reached;
 	//     ErrRequestCanceled - when the request is canceled;
 	//
 	// @param buffer
@@ -39,21 +36,22 @@ type WriteFileRequest struct {
 	//     The size of data put in the buffer.
 	PreCallback func(request *WriteFileRequest, err error, buffer *[]byte) (dataSize int)
 
-	// The function called when data is sent.
+	// The function called after sending data.
 	//
 	// @param request
 	//     The request bound to.
 	//
 	// @param err
 	//     ErrClosed - when the loop is closed;
+	//     ErrFileNotAttached - when the file is not attached;
 	//     ErrFileDetached - when the file is detached;
 	//     ErrDeadlineReached - when the deadline is reached;
 	//     ErrRequestCanceled - when the request is canceled;
 	//     the other errors the syscall.Write() returned.
 	//
-	// @param numberOfBytesWritten
+	// @param numberOfBytesSent
 	//     The size of data sent.
-	PostCallback func(request *WriteFileRequest, err error, numberOfBytesWritten int)
+	PostCallback func(request *WriteFileRequest, err error, numberOfBytesSent int)
 
 	// The optional function called when the request is released.
 	//
@@ -61,9 +59,9 @@ type WriteFileRequest struct {
 	//     The request bound to.
 	Cleanup func(request *WriteFileRequest)
 
-	r                    request
-	numberOfBytesWritten int
-	unsentData           []byte
+	r                 request
+	numberOfBytesSent int
+	unsentData        []byte
 }
 
 // WriteFile requests to write the given file in the loop.
@@ -71,15 +69,13 @@ type WriteFileRequest struct {
 func (l *Loop) WriteFile(request1 *WriteFileRequest) uint64 {
 	request1.r.OnTask = func(r *request) bool {
 		r1 := getWriteFileRequest(r)
-		l := r1.r.Loop()
 
-		if err := l.addWatch(&r1.r, r1.FD, poller.EventWritable); err != nil {
-			r1.PreCallback(r1, err, nil)
+		if isCompleted := r1.process(); isCompleted {
 			return true
 		}
 
 		if !r1.Deadline.IsZero() {
-			l.addAlarm(&r1.r, r1.Deadline)
+			r1.r.Loop().addAlarm(&r1.r, r1.Deadline)
 		}
 
 		return false
@@ -87,36 +83,22 @@ func (l *Loop) WriteFile(request1 *WriteFileRequest) uint64 {
 
 	request1.r.OnWatch = func(r *request) bool {
 		r1 := getWriteFileRequest(r)
-		var isCompleted bool
-
-		if r1.numberOfBytesWritten == 0 {
-			isCompleted = r1.onWatch1()
-		} else {
-			isCompleted = r1.onWatch2()
-		}
-
-		return isCompleted
+		return r1.process()
 	}
 
 	request1.r.OnAlarm = func(r *request) bool {
 		r1 := getWriteFileRequest(r)
-
-		if r1.numberOfBytesWritten == 0 {
-			r1.PreCallback(r1, ErrDeadlineReached, nil)
-		} else {
-			r1.PostCallback(r1, ErrDeadlineReached, r1.numberOfBytesWritten)
-		}
-
+		r1.PostCallback(r1, ErrDeadlineReached, r1.numberOfBytesSent)
 		return true
 	}
 
 	request1.r.OnError = func(r *request, err error) {
 		r1 := getWriteFileRequest(r)
 
-		if r1.numberOfBytesWritten == 0 {
+		if r1.unsentData == nil {
 			r1.PreCallback(r1, err, nil)
 		} else {
-			r1.PostCallback(r1, err, r1.numberOfBytesWritten)
+			r1.PostCallback(r1, err, r1.numberOfBytesSent)
 		}
 	}
 
@@ -131,39 +113,45 @@ func (l *Loop) WriteFile(request1 *WriteFileRequest) uint64 {
 	return l.preAddRequest(&request1.r)
 }
 
-func (r *WriteFileRequest) onWatch1() bool {
+func (r *WriteFileRequest) process() bool {
 	l := r.r.Loop()
-	dataSize := r.PreCallback(r, nil, &l.writeBuffer)
 
-	for {
-		unsentData := l.writeBuffer[r.numberOfBytesWritten:dataSize]
-		n, err := syscall.Write(r.FD, unsentData)
+	if r.unsentData == nil {
+		dataSize := r.PreCallback(r, nil, &l.writeBuffer)
 
-		if err != nil {
-			switch err {
-			case syscall.EINTR:
-				continue
-			case syscall.EAGAIN:
-				r.unsentData = make([]byte, len(unsentData))
-				copy(r.unsentData, unsentData)
-				l.addWatch(&r.r, r.FD, poller.EventWritable)
-				return false
-			default:
-				r.PostCallback(r, err, r.numberOfBytesWritten)
+		for {
+			unsentData := l.writeBuffer[r.numberOfBytesSent:dataSize]
+			n, err := syscall.Write(r.FD, unsentData)
+
+			if err != nil {
+				switch err {
+				case syscall.EINTR:
+					continue
+				case syscall.EAGAIN:
+					r.unsentData = make([]byte, len(unsentData))
+					copy(r.unsentData, unsentData)
+
+					if err := l.addWatch(&r.r, r.FD, poller.EventWritable); err != nil {
+						r.PostCallback(r, err, r.numberOfBytesSent)
+						return true
+					}
+
+					return false
+				default:
+					r.PostCallback(r, err, r.numberOfBytesSent)
+					return true
+				}
+			}
+
+			r.numberOfBytesSent += n
+
+			if r.numberOfBytesSent == dataSize {
+				r.PostCallback(r, nil, r.numberOfBytesSent)
 				return true
 			}
 		}
-
-		r.numberOfBytesWritten += n
-
-		if r.numberOfBytesWritten == dataSize {
-			r.PostCallback(r, nil, r.numberOfBytesWritten)
-			return true
-		}
 	}
-}
 
-func (r *WriteFileRequest) onWatch2() bool {
 	for {
 		n, err := syscall.Write(r.FD, r.unsentData)
 
@@ -172,19 +160,24 @@ func (r *WriteFileRequest) onWatch2() bool {
 			case syscall.EINTR:
 				continue
 			case syscall.EAGAIN:
-				r.r.Loop().addWatch(&r.r, r.FD, poller.EventWritable)
+				if err := l.addWatch(&r.r, r.FD, poller.EventWritable); err != nil {
+					r.PostCallback(r, err, r.numberOfBytesSent)
+					return true
+				}
+
 				return false
 			default:
-				r.PostCallback(r, err, r.numberOfBytesWritten)
+				r.PostCallback(r, err, r.numberOfBytesSent)
 				return true
 			}
 		}
 
-		r.numberOfBytesWritten += n
+		r.numberOfBytesSent += n
 		r.unsentData = r.unsentData[n:]
 
 		if len(r.unsentData) == 0 {
-			r.PostCallback(r, nil, r.numberOfBytesWritten)
+			r.unsentData = nil
+			r.PostCallback(r, nil, r.numberOfBytesSent)
 			return true
 		}
 	}

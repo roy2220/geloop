@@ -34,10 +34,12 @@ func TestLoopWriteFile(t *testing.T) {
 		l.WriteFile(&geloop.WriteFileRequest{
 			FD: fds[1],
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
-				err <- err2
-				return 0
+				*buffer = []byte{0}
+				return 1
 			},
-			PostCallback: func(*geloop.WriteFileRequest, error, int) {},
+			PostCallback: func(_ *geloop.WriteFileRequest, err2 error, numberOfBytesSent int) {
+				err <- err2
+			},
 		})
 		assert.EqualError(t, <-err, geloop.ErrFileNotAttached.Error())
 		l.Stop()
@@ -57,10 +59,12 @@ func TestLoopWriteFile(t *testing.T) {
 			FD:       fds[1],
 			Deadline: time.Now().Add(time.Second),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
-				err <- err2
-				return 0
+				*buffer = []byte{0}
+				return 1
 			},
-			PostCallback: func(*geloop.WriteFileRequest, error, int) {},
+			PostCallback: func(_ *geloop.WriteFileRequest, err2 error, numberOfBytesSent int) {
+				err <- err2
+			},
 		})
 		go func() {
 			time.Sleep(time.Second / 2)
@@ -87,10 +91,12 @@ func TestLoopWriteFile(t *testing.T) {
 			FD:       fds[1],
 			Deadline: time.Now().Add(time.Second / 2),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
-				err <- err2
-				return 0
+				*buffer = []byte{0}
+				return 1
 			},
-			PostCallback: func(*geloop.WriteFileRequest, error, int) {},
+			PostCallback: func(_ *geloop.WriteFileRequest, err2 error, numberOfBytesSent int) {
+				err <- err2
+			},
 		})
 		t0 := time.Now()
 		assert.EqualError(t, <-err, geloop.ErrDeadlineReached.Error())
@@ -106,17 +112,20 @@ func TestLoopWriteFile(t *testing.T) {
 			Deadline: time.Now().Add(time.Second),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				err <- err2
-				return 0
+				*buffer = []byte{0}
+				return 1
 			},
 			PostCallback: func(_ *geloop.WriteFileRequest, err2 error, n int) {
 				err <- err2
-				assert.Equal(t, 0, n)
+				assert.Equal(t, 1, n)
 				return
 			},
 		})
 		go func() {
 			time.Sleep(time.Second / 2)
 			_, err := syscall.Read(fds[0], make([]byte, 1024*1024))
+			assert.NoError(t, err)
+			_, err = syscall.Read(fds[0], make([]byte, 1024*1024))
 			assert.NoError(t, err)
 		}()
 		assert.NoError(t, <-err)
@@ -157,7 +166,7 @@ func TestLoopWriteFile(t *testing.T) {
 				}
 				i += n
 			}
-			assert.Equal(t, data, buf)
+			assert.Equal(t, data, buf, "%q ------ %q", data[:100], buf[:100])
 		}()
 		assert.NoError(t, <-err)
 		assert.NoError(t, <-err)

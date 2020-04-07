@@ -46,7 +46,7 @@ func runEchoServer(ctx context.Context) {
 				*buffer = append((*buffer)[:0], data...) // put data to the shared buffer
 				return len(data)
 			},
-			PostCallback: func(request *geloop.WriteFileRequest, err error, numberOfBytesWritten int) {
+			PostCallback: func(request *geloop.WriteFileRequest, err error, numberOfBytesSent int) {
 				if err != nil {
 					closeOnError(err, request.FD)
 					return
