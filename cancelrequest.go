@@ -5,7 +5,7 @@ import (
 	"unsafe"
 )
 
-// Cancel requests to cancel a request with the given id.
+// CancelRequest requests to cancel a request with the given id.
 func (l *Loop) CancelRequest(requestID uint64) {
 	if requestID == 0 {
 		return
