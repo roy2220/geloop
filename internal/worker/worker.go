@@ -94,32 +94,40 @@ func (w *Worker) AddTask(task *Task) error {
 func (w *Worker) CheckTasks(callback func(*Task)) error {
 	taskList := new(intrusive.List).Init()
 
-	if err := w.removeTasks(taskList); err != nil {
-		return err
-	}
+	for {
+		ok, err := w.removeTasks(taskList)
 
-	for listHead := taskList.Head(); !listHead.IsNull(taskList); listHead = taskList.Head() {
-		listHead.Remove()
-		task := (*Task)(listHead.GetContainer(unsafe.Offsetof(Task{}.listNode)))
-		*task = Task{}
-		callback(task)
-	}
+		if err != nil {
+			return err
+		}
 
-	return nil
+		if !ok {
+			return nil
+		}
+
+		for listHead := taskList.Head(); !listHead.IsNull(taskList); listHead = taskList.Head() {
+			listHead.Remove()
+			task := (*Task)(listHead.GetContainer(unsafe.Offsetof(Task{}.listNode)))
+			*task = Task{}
+			callback(task)
+		}
+
+		taskList.Init()
+	}
 }
 
-func (w *Worker) removeTasks(taskList *intrusive.List) error {
+func (w *Worker) removeTasks(taskList *intrusive.List) (bool, error) {
 	w.taskListLock.Lock()
 	defer w.taskListLock.Unlock()
 
 	if w.taskList.IsEmpty() {
-		return nil
+		return false, nil
 	}
 
 	taskList.AppendNodes(&w.taskList)
 	var temp [8]byte
 	_, err := syscall.Read(w.fd, temp[:])
-	return err
+	return true, err
 }
 
 // Task ...
