@@ -3,63 +3,35 @@ package main
 import (
 	"context"
 	"fmt"
+	// "net/http"
+	// _ "net/http/pprof"
 	"os"
 	"os/signal"
+	"unsafe"
 
 	"github.com/roy2220/geloop"
+	"github.com/roy2220/geloop/byteslicepool"
 )
+
+func main() {
+	// go func() {
+	//	fmt.Println(http.ListenAndServe("127.0.0.1:3389", nil))
+	// }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		c := make(chan os.Signal)
+		signal.Notify(c, os.Interrupt)
+		<-c
+		cancel()
+	}()
+	runEchoServer(ctx)
+}
 
 func runEchoServer(ctx context.Context) {
 	loop := new(geloop.Loop).Init()
 	if err := loop.Open(); err != nil {
 		panic(err)
-	}
-
-	closeOnError := func(err error, fd int) {
-		if err != geloop.ErrFileDetached {
-			loop.DetachFile(&geloop.DetachFileRequest{FD: fd, CloseFile: true})
-		}
-	}
-	read := func(fd int, callback func(data []byte)) {
-		loop.ReadFile(&geloop.ReadFileRequest{
-			FD: fd,
-			Callback: func(request *geloop.ReadFileRequest, err error, data []byte, _ []byte) (needMoreData bool) {
-				if err != nil {
-					closeOnError(err, request.FD)
-					return
-				}
-				dataCopy := make([]byte, len(data))
-				copy(dataCopy, data) // copy data from the shared buffer
-				callback(dataCopy)
-				return false
-			},
-		})
-	}
-	write := func(fd int, data []byte, callback func(fd int)) {
-		loop.WriteFile(&geloop.WriteFileRequest{
-			FD: fd,
-			PreCallback: func(request *geloop.WriteFileRequest, err error, buffer *[]byte) (dataSize int) {
-				if err != nil {
-					closeOnError(err, request.FD)
-					return
-				}
-				*buffer = append((*buffer)[:0], data...) // put data to the shared buffer
-				return len(data)
-			},
-			PostCallback: func(request *geloop.WriteFileRequest, err error, numberOfBytesSent int) {
-				if err != nil {
-					closeOnError(err, request.FD)
-					return
-				}
-				callback(request.FD)
-			},
-		})
-	}
-	var pipe func(int)
-	pipe = func(fd int) {
-		read(fd, func(data []byte) {
-			write(fd, data, pipe)
-		})
 	}
 
 	requestID, err := loop.AcceptSockets(&geloop.AcceptSocketsRequest{
@@ -71,7 +43,7 @@ func runEchoServer(ctx context.Context) {
 				loop.Stop()
 				return
 			}
-			pipe(fd)
+			handleConn(loop, fd)
 		},
 	})
 	if err != nil {
@@ -87,13 +59,66 @@ func runEchoServer(ctx context.Context) {
 	loop.Close()
 }
 
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, os.Interrupt)
-		<-c
-		cancel()
-	}()
-	runEchoServer(ctx)
+func handleConn(loop *geloop.Loop, fd int) {
+	c := conn{
+		loop: loop,
+		fd:   fd,
+	}
+	c.read()
+}
+
+type conn struct {
+	loop             *geloop.Loop
+	fd               int
+	readFileRequest  geloop.ReadFileRequest
+	dataToSent       []byte
+	writeFileRequest geloop.WriteFileRequest
+}
+
+func (c *conn) read() {
+	c.readFileRequest = geloop.ReadFileRequest{
+		FD: c.fd,
+		Callback: func(request *geloop.ReadFileRequest, err error, data []byte, _ []byte) (needMoreData bool) {
+			c := (*conn)(unsafe.Pointer(uintptr(unsafe.Pointer(request)) - unsafe.Offsetof(conn{}.readFileRequest)))
+			if err != nil {
+				c.close()
+				return
+			}
+			dataCopy := append(byteslicepool.Get(), data...)
+			c.write(dataCopy)
+			return false
+		},
+	}
+	c.loop.ReadFile(&c.readFileRequest)
+}
+
+func (c *conn) write(data []byte) {
+	c.dataToSent = data
+	c.writeFileRequest = geloop.WriteFileRequest{
+		FD: c.fd,
+		PreCallback: func(request *geloop.WriteFileRequest, err error, buffer *[]byte) (dataSize int) {
+			c := (*conn)(unsafe.Pointer(uintptr(unsafe.Pointer(request)) - unsafe.Offsetof(conn{}.writeFileRequest)))
+			if err != nil {
+				c.close()
+				return
+			}
+			*buffer = append((*buffer)[:0], c.dataToSent...) // put data to the shared buffer
+			n := len(c.dataToSent)
+			byteslicepool.Put(c.dataToSent)
+			return n
+		},
+		PostCallback: func(request *geloop.WriteFileRequest, err error, numberOfBytesSent int) {
+			c := (*conn)(unsafe.Pointer(uintptr(unsafe.Pointer(request)) - unsafe.Offsetof(conn{}.writeFileRequest)))
+			if err != nil {
+				c.close()
+				return
+			}
+			c.read()
+		},
+	}
+	c.loop.WriteFile(&c.writeFileRequest)
+}
+
+func (c *conn) close() {
+	c.loop.DetachFile(&geloop.DetachFileRequest{FD: c.fd, CloseFile: true})
 }

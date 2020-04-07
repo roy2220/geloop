@@ -5,6 +5,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/roy2220/geloop/byteslicepool"
 	"github.com/roy2220/geloop/internal/poller"
 )
 
@@ -62,6 +63,7 @@ type WriteFileRequest struct {
 	r                 request
 	numberOfBytesSent int
 	unsentData        []byte
+	bufferToReuse     []byte
 }
 
 // WriteFile requests to write the given file in the loop.
@@ -128,8 +130,8 @@ func (r *WriteFileRequest) process() bool {
 				case syscall.EINTR:
 					continue
 				case syscall.EAGAIN:
-					r.unsentData = make([]byte, len(unsentData))
-					copy(r.unsentData, unsentData)
+					r.unsentData = append(byteslicepool.Get(), unsentData...)
+					r.bufferToReuse = r.unsentData
 
 					if err := l.addWatch(&r.r, r.FD, poller.EventWritable); err != nil {
 						r.PostCallback(r, err, r.numberOfBytesSent)
@@ -177,6 +179,8 @@ func (r *WriteFileRequest) process() bool {
 
 		if len(r.unsentData) == 0 {
 			r.unsentData = nil
+			byteslicepool.Put(r.bufferToReuse)
+			r.bufferToReuse = nil
 			r.PostCallback(r, nil, r.numberOfBytesSent)
 			return true
 		}
