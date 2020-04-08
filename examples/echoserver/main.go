@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"strconv"
+
 	// "net/http"
 	// _ "net/http/pprof"
 	"os"
@@ -12,6 +15,13 @@ import (
 	"github.com/roy2220/geloop"
 	"github.com/roy2220/geloop/byteslicepool"
 )
+
+var listenPort int
+
+func init() {
+	flag.IntVar(&listenPort, "p", 8888, "help message for flagname")
+	flag.Parse()
+}
 
 func main() {
 	// go func() {
@@ -34,9 +44,11 @@ func runEchoServer(ctx context.Context) {
 		panic(err)
 	}
 
+	listenAddress := "0.0.0.0:" + strconv.Itoa(listenPort)
+	fmt.Printf("listening on %s ...\n", listenAddress)
 	requestID, err := loop.AcceptSockets(&geloop.AcceptSocketsRequest{
 		NetworkName:   "tcp4",
-		ListenAddress: "127.0.0.1:8888",
+		ListenAddress: listenAddress,
 		Callback: func(request *geloop.AcceptSocketsRequest, err error, fd int) {
 			if err != nil {
 				fmt.Printf("accept sockets error: %v", err)
@@ -81,10 +93,10 @@ func (c *conn) read() {
 		Callback: func(request *geloop.ReadFileRequest, err error, data []byte, _ []byte) (needMoreData bool) {
 			c := (*conn)(unsafe.Pointer(uintptr(unsafe.Pointer(request)) - unsafe.Offsetof(conn{}.readFileRequest)))
 			if err != nil {
-				c.close()
+				c.closeOnError(err)
 				return
 			}
-			dataCopy := append(byteslicepool.Get(), data...)
+			dataCopy := append(byteslicepool.Get(), data...) // copy data from shared buffer
 			c.write(dataCopy)
 			return false
 		},
@@ -99,10 +111,10 @@ func (c *conn) write(data []byte) {
 		PreCallback: func(request *geloop.WriteFileRequest, err error, buffer *[]byte) (dataSize int) {
 			c := (*conn)(unsafe.Pointer(uintptr(unsafe.Pointer(request)) - unsafe.Offsetof(conn{}.writeFileRequest)))
 			if err != nil {
-				c.close()
+				c.closeOnError(err)
 				return
 			}
-			*buffer = append((*buffer)[:0], c.dataToSent...) // put data to the shared buffer
+			*buffer = append((*buffer)[:0], c.dataToSent...) // put data to shared buffer
 			n := len(c.dataToSent)
 			byteslicepool.Put(c.dataToSent)
 			return n
@@ -110,7 +122,7 @@ func (c *conn) write(data []byte) {
 		PostCallback: func(request *geloop.WriteFileRequest, err error, numberOfBytesSent int) {
 			c := (*conn)(unsafe.Pointer(uintptr(unsafe.Pointer(request)) - unsafe.Offsetof(conn{}.writeFileRequest)))
 			if err != nil {
-				c.close()
+				c.closeOnError(err)
 				return
 			}
 			c.read()
@@ -119,6 +131,7 @@ func (c *conn) write(data []byte) {
 	c.loop.WriteFile(&c.writeFileRequest)
 }
 
-func (c *conn) close() {
+func (c *conn) closeOnError(err error) {
+	fmt.Printf("close conn fd=%d err=%q\n", c.fd, err)
 	c.loop.DetachFile(&geloop.DetachFileRequest{FD: c.fd, CloseFile: true})
 }

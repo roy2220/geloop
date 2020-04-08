@@ -3,6 +3,7 @@ package geloop
 
 import (
 	"errors"
+	"runtime"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -73,6 +74,8 @@ func (l *Loop) Close() error {
 
 // Run runs the loop.
 func (l *Loop) Run() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	l.isStopped = false
 
 	for !l.isStopped {
