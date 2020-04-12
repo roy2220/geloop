@@ -18,7 +18,7 @@ func (t *Timer) Init() *Timer {
 		alarm1 := (*Alarm)(heapNode1.GetContainer(unsafe.Offsetof(Alarm{}.heapNode)))
 		alarm2 := (*Alarm)(heapNode2.GetContainer(unsafe.Offsetof(Alarm{}.heapNode)))
 		return alarm1.dueTime.Before(alarm2.dueTime)
-	}, numberOfReservedAlarmHeapNodes)
+	}, initialAlarmHeapCapacity)
 
 	return t
 }
@@ -47,8 +47,8 @@ func (t *Timer) RemoveAlarm(alarm *Alarm) {
 	*alarm = Alarm{}
 }
 
-// CheckAlarms ...
-func (t *Timer) CheckAlarms(callback func(*Alarm)) {
+// ProcessAlarms ...
+func (t *Timer) ProcessAlarms(callback func(*Alarm)) {
 	now := time.Now()
 
 	for heapTop, ok := t.alarmHeap.GetTop(); ok; heapTop, ok = t.alarmHeap.GetTop() {
@@ -85,4 +85,4 @@ type Alarm struct {
 // IsReset ...
 func (a *Alarm) IsReset() bool { return a.heapNode.IsReset() }
 
-const numberOfReservedAlarmHeapNodes = 64
+const initialAlarmHeapCapacity = 64

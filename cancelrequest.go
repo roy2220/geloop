@@ -18,9 +18,7 @@ func (l *Loop) CancelRequest(requestID uint64) {
 		r1 := getFreeCancelRequestRequest(r)
 
 		if requestToCancel, ok := r1.R.Loop().getRequest(r1.IDOfRequestToCancel); ok {
-			requestToCancel.OnError(requestToCancel, ErrRequestCanceled)
-			requestToCancel.remove()
-			requestToCancel.release()
+			requestToCancel.Cancel()
 		}
 
 		return true
@@ -29,11 +27,11 @@ func (l *Loop) CancelRequest(requestID uint64) {
 	request1.R.OnError = func(*request, error) {}
 
 	request1.R.OnCleanup = func(r *request) {
-		r1 := (*cancelRequestRequest)((unsafe.Pointer)(r))
+		r1 := getFreeCancelRequestRequest(r)
 		freeCancelRequestRequest(r1)
 	}
 
-	l.preAddRequest(&request1.R)
+	request1.R.Process(l)
 }
 
 type cancelRequestRequest struct {

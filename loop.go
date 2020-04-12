@@ -2,9 +2,7 @@
 package geloop
 
 import (
-	"errors"
 	"runtime"
-	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -15,26 +13,26 @@ import (
 
 // Loop represents an event loop.
 type Loop struct {
-	poller        poller.Poller
-	timer         timer.Timer
-	worker        worker.Worker
-	workerWatch   *poller.Watch
-	lastRequestID uint64
-	requests      map[uint64]*request
-	readBuffer    []byte
-	writeBuffer   []byte
-	isStopped     bool
+	reservedReadBufferSize int
+	poller                 poller.Poller
+	timer                  timer.Timer
+	worker                 worker.Worker
+	workerWatch            *poller.Watch
+	isBroken               bool
+	requests               map[uint64]*request
+	readBuffer             []byte
+	writeBuffer            []byte
 }
 
 // Init initializes the loop and then returns the loop.
-func (l *Loop) Init() *Loop {
+func (l *Loop) Init(reservedReadBufferSize int) *Loop {
+	l.reservedReadBufferSize = reservedReadBufferSize
 	l.poller.Init()
 	l.timer.Init()
 	l.worker.Init(&l.poller)
 	l.workerWatch = &(&request{OnWatch: func(*request) bool { return false }}).watch
-	l.isStopped = true
 	l.requests = make(map[uint64]*request)
-	l.readBuffer = make([]byte, initialReadBufferSize)
+	l.readBuffer = make([]byte, reservedReadBufferSize+initialReadBufferSize)
 	l.writeBuffer = make([]byte, initialWriteBufferSize)
 	return l
 }
@@ -56,46 +54,52 @@ func (l *Loop) Open() error {
 // Close closes the loop.
 func (l *Loop) Close() error {
 	if err := l.worker.Close(func(task *worker.Task) {
-		request := (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(task)) - unsafe.Offsetof(request{}.task)))
-		request.OnError(request, ErrClosed)
-		request.release()
+		request := getRequestByTask(task)
+		request.handleError(ErrClosed)
 	}); err != nil {
 		return err
 	}
 
-	for _, request := range l.requests {
-		request.remove()
-		request.release()
+	if err := l.poller.Close(func(watch *poller.Watch) {
+		request := getRequestByWatch(watch)
+		request.handleError(ErrClosed)
+	}); err != nil {
+		return err
 	}
 
-	l.timer.Close(func(*timer.Alarm) {})
-	return l.poller.Close(func(*poller.Watch) {})
+	l.timer.Close(func(alarm *timer.Alarm) {
+		request := getRequestByAlarm(alarm)
+		request.handleError(ErrClosed)
+	})
+
+	return nil
 }
 
 // Run runs the loop.
 func (l *Loop) Run() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	l.isStopped = false
+	l.isBroken = false
 
-	for !l.isStopped {
-		l.tick()
+	for !l.isBroken {
+		l.iterate()
 	}
 }
 
 // Stop requests to stop the loop.
 func (l *Loop) Stop() {
-	l.preAddRequest(&request{
+	(&request{
 		OnTask: func(*request) bool {
-			l.isStopped = true
+			l.isBroken = true
 			return true
 		},
 
-		OnError: func(*request, error) {},
-	})
+		OnError:   func(*request, error) {},
+		OnCleanup: func(*request) {},
+	}).Process(l)
 }
 
-func (l *Loop) tick() {
+func (l *Loop) iterate() {
 	deadline, _ := l.timer.GetMinDueTime()
 
 	if l.workerWatch.IsReset() {
@@ -105,38 +109,26 @@ func (l *Loop) tick() {
 	}
 
 	// println("--- poller begin ---")
-	if err := l.poller.CheckWatches(deadline, func(watch *poller.Watch) {
-		request := (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(watch)) - unsafe.Offsetof(request{}.watch)))
-
-		if request.OnWatch(request) {
-			request.remove()
-			request.release()
-		}
+	if err := l.poller.ProcessWatches(deadline, func(watch *poller.Watch) {
+		request := getRequestByWatch(watch)
+		request.handleWatch()
 	}); err != nil {
 		panic(err)
 	}
 	// println("--- poller end ---")
 
 	// println("--- timer begin ---")
-	l.timer.CheckAlarms(func(alarm *timer.Alarm) {
-		request := (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(alarm)) - unsafe.Offsetof(request{}.alarm)))
-
-		if request.OnAlarm(request) {
-			request.remove()
-			request.release()
-		}
+	l.timer.ProcessAlarms(func(alarm *timer.Alarm) {
+		request := getRequestByAlarm(alarm)
+		request.handleAlarm()
 	})
 	// println("--- timer end ---")
 
 	// println("--- worker begin ---")
-	if err := l.worker.CheckTasks(func(task *worker.Task) {
-		request := (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(task)) - unsafe.Offsetof(request{}.task)))
-		request.postAdd()
-
-		if request.OnTask(request) {
-			request.remove()
-			request.release()
-		}
+	if err := l.worker.ProcessTasks(func(task *worker.Task) {
+		request := getRequestByTask(task)
+		request.add()
+		request.handleTask()
 	}); err != nil {
 		panic(err)
 	}
@@ -144,20 +136,74 @@ func (l *Loop) tick() {
 
 }
 
-func (l *Loop) preAddRequest(request *request) uint64 {
-	request.l = l
-	request.id = atomic.AddUint64(&l.lastRequestID, 1)
+func (l *Loop) addTask(task *worker.Task) error {
+	err := l.worker.AddTask(task)
 
-	if err := l.addTask(request); err != nil {
-		go func() {
-			request.OnError(request, err)
-			request.release()
-		}()
-
-		return 0
+	if err != nil {
+		switch err {
+		case worker.ErrClosed:
+			err = ErrClosed
+		default:
+			panic(err)
+		}
 	}
 
-	return request.id
+	return err
+}
+
+func (l *Loop) adoptFd(fd int) {
+	l.poller.AdoptFd(fd)
+}
+
+func (l *Loop) closeFd(fd int) error {
+	err := l.poller.CloseFd(fd, func(watch *poller.Watch) {
+		r := getRequestByWatch(watch)
+		r.handleError(ErrFdClosed)
+	})
+
+	if err != nil {
+		switch err {
+		case poller.ErrInvalidFd:
+			err = ErrInvalidFd
+		}
+	}
+
+	return err
+}
+
+func (l *Loop) addWatch(watch *poller.Watch, fd int, eventType poller.EventType) error {
+	err := l.poller.AddWatch(watch, fd, eventType)
+
+	if err != nil {
+		switch err {
+		case poller.ErrInvalidFd:
+			err = ErrInvalidFd
+		default:
+			panic(err)
+		}
+	}
+
+	return err
+}
+
+func (l *Loop) removeWatch(watch *poller.Watch) {
+	l.poller.RemoveWatch(watch)
+}
+
+func (l *Loop) addAlarm(alarm *timer.Alarm, dueTime time.Time) {
+	l.timer.AddAlarm(alarm, dueTime)
+}
+
+func (l *Loop) removeAlarm(alarm *timer.Alarm) {
+	l.timer.RemoveAlarm(alarm)
+}
+
+func (l *Loop) addRequest(requestID uint64, request *request) {
+	l.requests[requestID] = request
+}
+
+func (l *Loop) removeRequest(requestID uint64) {
+	delete(l.requests, requestID)
 }
 
 func (l *Loop) getRequest(requestID uint64) (*request, bool) {
@@ -165,148 +211,19 @@ func (l *Loop) getRequest(requestID uint64) (*request, bool) {
 	return request, ok
 }
 
-func (l *Loop) addTask(request *request) error {
-	err := l.worker.AddTask(&request.task)
-
-	if err != nil {
-		if err != worker.ErrClosed {
-			panic(err)
-		}
-
-		err = ErrClosed
-	}
-
-	return err
-}
-
-func (l *Loop) addWatch(request *request, fd int, eventType poller.EventType) error {
-	err := l.poller.AddWatch(&request.watch, fd, eventType)
-
-	if err != nil {
-		if err != poller.ErrFileNotAttached {
-			panic(err)
-		}
-
-		err = ErrFileNotAttached
-	}
-
-	return err
-}
-
-func (l *Loop) removeWatch(request *request) bool {
-	return l.poller.RemoveWatch(&request.watch)
-}
-
-func (l *Loop) addAlarm(request *request, dueTime time.Time) {
-	l.timer.AddAlarm(&request.alarm, dueTime)
-}
-
-func (l *Loop) removeAlarm(request *request) {
-	l.timer.RemoveAlarm(&request.alarm)
-}
-
-func (l *Loop) attachFile(fd int) bool {
-	if l.poller.HasFile(fd) {
-		return false
-	}
-
-	l.poller.AttachFile(fd)
-	return true
-}
-
-func (l *Loop) detachFile(fd int) bool {
-	ok, err := l.poller.DetachFile(fd, func(watch *poller.Watch) {
-		request := (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(watch)) - unsafe.Offsetof(request{}.watch)))
-		request.OnError(request, ErrFileDetached)
-		request.remove()
-		request.release()
-	})
-
-	if err != nil {
-		panic(err)
-	}
-
-	return ok
-}
-
-var (
-	// ErrClosed indicates the loop is closed.
-	ErrClosed = errors.New("geloop: closed")
-
-	// ErrFileNotAttached indicates the file to read/write is not yet attached.
-	ErrFileNotAttached = errors.New("geloop: file not attached")
-
-	// ErrFileDetached indicates the file has been detached during being read/written.
-	ErrFileDetached = errors.New("geloop: file detached")
-
-	// ErrDeadlineReached indicates the deadline is reached before the file is read/written.
-	ErrDeadlineReached = errors.New("geloop: deadline reached")
-
-	// ErrNoMoreData indicates there no more data can be read from the file.
-	ErrNoMoreData = errors.New("geloop: no more data")
-
-	// ErrRequestCanceled indicates the request is canceled.
-	ErrRequestCanceled = errors.New("geloop: request canceled")
-)
-
 const (
-	initialReadBufferSize  = 2048
+	initialReadBufferSize  = 1024
 	initialWriteBufferSize = 1024
 )
 
-type request struct {
-	OnTask    func(r *request) (isCompleted bool)
-	OnWatch   func(r *request) (isCompleted bool)
-	OnAlarm   func(r *request) (isCompleted bool)
-	OnError   func(r *request, err error)
-	OnCleanup func(r *request)
-
-	l     *Loop
-	id    uint64
-	task  worker.Task
-	watch poller.Watch
-	alarm timer.Alarm
+func getRequestByTask(task *worker.Task) *request {
+	return (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(task)) - unsafe.Offsetof(request{}.task)))
 }
 
-func (r *request) Loop() *Loop {
-	return r.l
+func getRequestByWatch(watch *poller.Watch) *request {
+	return (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(watch)) - unsafe.Offsetof(request{}.watch)))
 }
 
-func (r *request) postAdd() {
-	r.l.requests[r.id] = r
-}
-
-func (r *request) remove() {
-	l := r.l
-
-	if !r.watchIsReset() {
-		l.removeWatch(r)
-	}
-
-	if !r.alarmIsReset() {
-		l.removeAlarm(r)
-	}
-
-	delete(l.requests, r.id)
-}
-
-func (r *request) release() {
-	if f := r.OnCleanup; f != nil {
-		f(r)
-	}
-
-	r.OnTask = nil
-	r.OnWatch = nil
-	r.OnAlarm = nil
-	r.OnError = nil
-	r.OnCleanup = nil
-	r.l = nil
-}
-
-func (r *request) watchIsReset() bool {
-	return r.watch.IsReset()
-}
-
-func (r *request) alarmIsReset() bool {
-	return r.alarm.IsReset()
+func getRequestByAlarm(alarm *timer.Alarm) *request {
+	return (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(alarm)) - unsafe.Offsetof(request{}.alarm)))
 }

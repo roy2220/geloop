@@ -12,11 +12,12 @@ import (
 
 // Worker ...
 type Worker struct {
-	poller       *poller.Poller
-	fd           int
-	taskList     intrusive.List
-	taskListLock sync.Mutex
-	isClosed     bool
+	poller                    *poller.Poller
+	fd                        int
+	taskList                  intrusive.List
+	taskListLock              sync.Mutex
+	isClosed                  bool
+	averageProcessedTaskCount mean
 }
 
 // Init ...
@@ -24,6 +25,7 @@ func (w *Worker) Init(poller *poller.Poller) *Worker {
 	w.poller = poller
 	w.fd = -1
 	w.taskList.Init()
+	w.averageProcessedTaskCount.Init(1000)
 	return w
 }
 
@@ -35,8 +37,9 @@ func (w *Worker) Open() error {
 		return err
 	}
 
-	w.fd = int(r1)
-	w.poller.AttachFile(w.fd)
+	fd := int(r1)
+	w.poller.AdoptFd(fd)
+	w.fd = fd
 	return nil
 }
 
@@ -56,12 +59,7 @@ func (w *Worker) Close(callback func(*Task)) error {
 	}
 
 	w.taskList = intrusive.List{}
-
-	if _, err := w.poller.DetachFile(w.fd, func(*poller.Watch) {}); err != nil {
-		return err
-	}
-
-	return syscall.Close(w.fd)
+	return w.poller.CloseFd(w.fd, func(*poller.Watch) {})
 }
 
 // AddWatch ...
@@ -78,31 +76,30 @@ func (w *Worker) AddTask(task *Task) error {
 		return ErrClosed
 	}
 
-	hadNoTask := w.taskList.IsEmpty()
-	w.taskList.AppendNode(&task.listNode)
-
-	if hadNoTask {
+	if w.taskList.IsEmpty() {
 		x := uint64(1)
-		_, err := syscall.Write(w.fd, (*(*[8]byte)(unsafe.Pointer(&x)))[:])
-		return err
+
+		if _, err := syscall.Write(w.fd, (*(*[8]byte)(unsafe.Pointer(&x)))[:]); err != nil {
+			return err
+		}
 	}
 
+	w.taskList.AppendNode(&task.listNode)
 	return nil
 }
 
-// CheckTasks ...
-func (w *Worker) CheckTasks(callback func(*Task)) error {
+// ProcessTasks ...
+func (w *Worker) ProcessTasks(callback func(*Task)) error {
 	taskList := new(intrusive.List).Init()
+	averageProcessedTaskCount := w.averageProcessedTaskCount.Calculate()
+	processedTaskCount := int64(0)
 
 	for {
 		ok, err := w.removeTasks(taskList)
 
-		if err != nil {
-			return err
-		}
-
 		if !ok {
-			return nil
+			w.averageProcessedTaskCount.UpdateSample(processedTaskCount)
+			return err
 		}
 
 		for listHead := taskList.Head(); !listHead.IsNull(taskList); listHead = taskList.Head() {
@@ -110,9 +107,13 @@ func (w *Worker) CheckTasks(callback func(*Task)) error {
 			task := (*Task)(listHead.GetContainer(unsafe.Offsetof(Task{}.listNode)))
 			*task = Task{}
 			callback(task)
+			processedTaskCount++
 		}
 
-		taskList.Init()
+		if processedTaskCount >= averageProcessedTaskCount {
+			w.averageProcessedTaskCount.UpdateSample(processedTaskCount)
+			return nil
+		}
 	}
 }
 
@@ -124,10 +125,14 @@ func (w *Worker) removeTasks(taskList *intrusive.List) (bool, error) {
 		return false, nil
 	}
 
-	taskList.AppendNodes(&w.taskList)
 	var temp [8]byte
-	_, err := syscall.Read(w.fd, temp[:])
-	return true, err
+
+	if _, err := syscall.Read(w.fd, temp[:]); err != nil {
+		return false, err
+	}
+
+	taskList.AppendNodes(&w.taskList)
+	return true, nil
 }
 
 // Task ...

@@ -10,7 +10,7 @@ import (
 )
 
 func TestLoopWriteFile(t *testing.T) {
-	l := new(geloop.Loop).Init()
+	l := new(geloop.Loop).Init(0)
 	err := l.Open()
 	if !assert.NoError(t, err) {
 		t.FailNow()
@@ -32,7 +32,7 @@ func TestLoopWriteFile(t *testing.T) {
 	go func() {
 		err := make(chan error, 1)
 		l.WriteFile(&geloop.WriteFileRequest{
-			FD: fds[1],
+			Fd: fds[1],
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				*buffer = []byte{0}
 				return 1
@@ -41,22 +41,26 @@ func TestLoopWriteFile(t *testing.T) {
 				err <- err2
 			},
 		})
-		assert.EqualError(t, <-err, geloop.ErrFileNotAttached.Error())
+		assert.EqualError(t, <-err, geloop.ErrInvalidFd.Error())
 		l.Stop()
 	}()
 	l.Run()
 
 	go func() {
+		fd, err2 := syscall.Dup(fds[1])
+		if !assert.NoError(t, err2) {
+			t.FailNow()
+		}
 		err := make(chan error, 1)
-		l.AttachFile(&geloop.AttachFileRequest{
-			FD: fds[1],
-			Callback: func(_ *geloop.AttachFileRequest, err2 error, _ bool) {
+		l.AdoptFd(&geloop.AdoptFdRequest{
+			Fd: fd,
+			Callback: func(_ *geloop.AdoptFdRequest, err2 error) {
 				err <- err2
 			},
 		})
 		assert.NoError(t, <-err)
 		l.WriteFile(&geloop.WriteFileRequest{
-			FD:       fds[1],
+			Fd:       fd,
 			Deadline: time.Now().Add(time.Second),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				*buffer = []byte{0}
@@ -68,27 +72,26 @@ func TestLoopWriteFile(t *testing.T) {
 		})
 		go func() {
 			time.Sleep(time.Second / 2)
-			l.DetachFile(&geloop.DetachFileRequest{
-				FD:       fds[1],
-				Callback: func(_ *geloop.DetachFileRequest, err2 error, _ bool) {},
+			l.CloseFd(&geloop.CloseFdRequest{
+				Fd: fd,
 			})
 		}()
-		assert.EqualError(t, <-err, geloop.ErrFileDetached.Error())
-		l.AttachFile(&geloop.AttachFileRequest{
-			FD: fds[1],
-			Callback: func(_ *geloop.AttachFileRequest, err2 error, _ bool) {
-				err <- err2
-			},
-		})
-		assert.NoError(t, <-err)
+		assert.EqualError(t, <-err, geloop.ErrFdClosed.Error())
 		l.Stop()
 	}()
 	l.Run()
 
 	go func() {
 		err := make(chan error, 1)
+		l.AdoptFd(&geloop.AdoptFdRequest{
+			Fd: fds[1],
+			Callback: func(_ *geloop.AdoptFdRequest, err2 error) {
+				err <- err2
+			},
+		})
+		assert.NoError(t, <-err)
 		l.WriteFile(&geloop.WriteFileRequest{
-			FD:       fds[1],
+			Fd:       fds[1],
 			Deadline: time.Now().Add(time.Second / 2),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				*buffer = []byte{0}
@@ -108,7 +111,7 @@ func TestLoopWriteFile(t *testing.T) {
 	go func() {
 		err := make(chan error, 2)
 		l.WriteFile(&geloop.WriteFileRequest{
-			FD:       fds[1],
+			Fd:       fds[1],
 			Deadline: time.Now().Add(time.Second),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				err <- err2
@@ -141,7 +144,7 @@ func TestLoopWriteFile(t *testing.T) {
 		}
 		err := make(chan error, 2)
 		l.WriteFile(&geloop.WriteFileRequest{
-			FD: fds[1],
+			Fd: fds[1],
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				err <- err2
 				*buffer = data
@@ -181,7 +184,7 @@ func TestLoopWriteFile(t *testing.T) {
 		}
 		err := make(chan error, 2)
 		l.WriteFile(&geloop.WriteFileRequest{
-			FD:       fds[1],
+			Fd:       fds[1],
 			Deadline: time.Now().Add(time.Second / 2),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				err <- err2
@@ -217,7 +220,7 @@ func TestLoopWriteFile(t *testing.T) {
 	go func() {
 		err := make(chan error, 2)
 		rid := l.WriteFile(&geloop.WriteFileRequest{
-			FD:       fds[1],
+			Fd:       fds[1],
 			Deadline: time.Now().Add(time.Second),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				err <- err2

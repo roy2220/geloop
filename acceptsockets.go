@@ -2,11 +2,8 @@ package geloop
 
 import (
 	"net"
-	"os"
 	"syscall"
 	"unsafe"
-
-	"github.com/roy2220/geloop/internal/poller"
 )
 
 // AcceptSocketsRequest represents the request about accepting sockets.
@@ -19,14 +16,15 @@ type AcceptSocketsRequest struct {
 	// The address listened on.
 	ListenAddress string
 
-	// The function called when data is received.
+	// The function called when there is a socket accepted.
 	//
 	// @param request
 	//     The request bound to.
 	//
 	// @param err
-	//     ErrClosed - when the loop is closed;
-	//     ErrRequestCanceled - when the request is canceled;
+	//     ErrClosed - when the loop has been closed;
+	//     ErrRequestCanceled - when the request has been
+	//                          canceled;
 	//     the other errors the syscall.Accept4() returned.
 	//
 	// @param fd
@@ -39,70 +37,42 @@ type AcceptSocketsRequest struct {
 	//     The request bound to.
 	Cleanup func(request *AcceptSocketsRequest)
 
-	r                      request
-	listenerFile           *os.File
-	listenerFD             int
-	listenerFileIsAttached bool
+	r                 request
+	listenFd          int
+	listenFdIsAdopted bool
 }
 
-// AcceptSockets requests to accept sockets to attach to the loop.
+// AcceptSockets requests to accept sockets to attach to the given loop.
 // It returns the request id for cancellation.
 func (l *Loop) AcceptSockets(request1 *AcceptSocketsRequest) (uint64, error) {
-	listener, err := net.Listen(request1.NetworkName, request1.ListenAddress)
+	listenFd, err := doListen(request1.NetworkName, request1.ListenAddress)
 
 	if err != nil {
 		return 0, err
 	}
 
-	var listenerFile *os.File
-
-	switch listener := listener.(type) {
-	case *net.TCPListener:
-		listenerFile, err = listener.File()
-	case *net.UnixListener:
-		listenerFile, err = listener.File()
-	default:
-		panic("unreachable code")
-	}
-
-	listener.Close()
-
-	if err != nil {
-		return 0, err
-	}
-
-	listenerFD := int(listenerFile.Fd())
-
-	if err := syscall.SetNonblock(listenerFD, true); err != nil {
-		listenerFile.Close()
-		return 0, err
-	}
-
-	request1.listenerFile = listenerFile
-	request1.listenerFD = listenerFD
+	request1.listenFd = listenFd
 
 	request1.r.OnTask = func(r *request) bool {
 		r1 := getAcceptSocketsRequest(r)
-		l := r1.r.Loop()
-		l.attachFile(r1.listenerFD)
-		r1.listenerFileIsAttached = true
-		l.addWatch(&r1.r, r1.listenerFD, poller.EventReadable)
+		r1.r.Loop().adoptFd(r1.listenFd)
+		r1.listenFdIsAdopted = true
+		r1.r.AddReadableWatch(r1.listenFd)
 		return false
 	}
 
 	request1.r.OnWatch = func(r *request) bool {
 		r1 := getAcceptSocketsRequest(r)
-		l := r1.r.Loop()
 
 		for {
-			fd, _, err := syscall.Accept4(r1.listenerFD, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
+			fd, _, err := syscall.Accept4(r1.listenFd, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
 
 			if err != nil {
 				switch err {
 				case syscall.EINTR, syscall.ECONNABORTED:
 					continue
 				case syscall.EAGAIN:
-					l.addWatch(&r1.r, r1.listenerFD, poller.EventReadable)
+					r1.r.AddReadableWatch(r1.listenFd)
 					return false
 				default:
 					r1.Callback(r1, err, -1)
@@ -110,7 +80,7 @@ func (l *Loop) AcceptSockets(request1 *AcceptSocketsRequest) (uint64, error) {
 				}
 			}
 
-			l.attachFile(fd)
+			r1.r.Loop().adoptFd(fd)
 			r1.Callback(r1, nil, fd)
 		}
 	}
@@ -123,22 +93,73 @@ func (l *Loop) AcceptSockets(request1 *AcceptSocketsRequest) (uint64, error) {
 	request1.r.OnCleanup = func(r *request) {
 		r1 := getAcceptSocketsRequest(r)
 
-		if r1.listenerFileIsAttached {
-			r1.r.Loop().detachFile(r1.listenerFD)
-			r1.listenerFileIsAttached = false
+		if r1.listenFdIsAdopted {
+			r.Loop().closeFd(r1.listenFd)
+			r1.listenFdIsAdopted = false
 		}
 
-		r1.listenerFile.Close()
-		r1.listenerFile = nil
+		r1.listenFd = 0
 
 		if f := r1.Cleanup; f != nil {
 			f(r1)
 		}
 	}
 
-	return l.preAddRequest(&request1.r), nil
+	return request1.r.Process(l), nil
 }
 
 func getAcceptSocketsRequest(r *request) *AcceptSocketsRequest {
 	return (*AcceptSocketsRequest)(unsafe.Pointer(uintptr(unsafe.Pointer(r)) - unsafe.Offsetof(AcceptSocketsRequest{}.r)))
+}
+
+func doListen(networkName, listenAddress string) (int, error) {
+	listener, err := net.Listen(networkName, listenAddress)
+
+	if err != nil {
+		return 0, err
+	}
+
+	var syscallConn syscall.RawConn
+
+	switch listener := listener.(type) {
+	case *net.TCPListener:
+		syscallConn, err = listener.SyscallConn()
+	case *net.UnixListener:
+		syscallConn, err = listener.SyscallConn()
+	default:
+		panic("unreachable code")
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	var listenFd int
+
+	if err2 := syscallConn.Control(func(fd uintptr) {
+		syscall.ForkLock.RLock()
+		defer syscall.ForkLock.RUnlock()
+		listenFd, err = syscall.Dup(int(fd))
+
+		if err != nil {
+			return
+		}
+
+		syscall.CloseOnExec(listenFd)
+	}); err2 != nil {
+		return 0, err2
+	}
+
+	listener.Close()
+
+	if err != nil {
+		return 0, err
+	}
+
+	if err := syscall.SetNonblock(listenFd, true); err != nil {
+		syscall.Close(listenFd)
+		return 0, err
+	}
+
+	return listenFd, nil
 }

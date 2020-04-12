@@ -39,7 +39,7 @@ func main() {
 }
 
 func runEchoServer(ctx context.Context) {
-	loop := new(geloop.Loop).Init()
+	loop := new(geloop.Loop).Init(0)
 	if err := loop.Open(); err != nil {
 		panic(err)
 	}
@@ -72,6 +72,7 @@ func runEchoServer(ctx context.Context) {
 }
 
 func handleConn(loop *geloop.Loop, fd int) {
+	fmt.Printf("new conn fd=%d\n", fd)
 	c := conn{
 		loop: loop,
 		fd:   fd,
@@ -89,7 +90,7 @@ type conn struct {
 
 func (c *conn) read() {
 	c.readFileRequest = geloop.ReadFileRequest{
-		FD: c.fd,
+		Fd: c.fd,
 		Callback: func(request *geloop.ReadFileRequest, err error, data []byte, _ []byte) (needMoreData bool) {
 			c := (*conn)(unsafe.Pointer(uintptr(unsafe.Pointer(request)) - unsafe.Offsetof(conn{}.readFileRequest)))
 			if err != nil {
@@ -107,7 +108,7 @@ func (c *conn) read() {
 func (c *conn) write(data []byte) {
 	c.dataToSent = data
 	c.writeFileRequest = geloop.WriteFileRequest{
-		FD: c.fd,
+		Fd: c.fd,
 		PreCallback: func(request *geloop.WriteFileRequest, err error, buffer *[]byte) (dataSize int) {
 			c := (*conn)(unsafe.Pointer(uintptr(unsafe.Pointer(request)) - unsafe.Offsetof(conn{}.writeFileRequest)))
 			if err != nil {
@@ -132,6 +133,10 @@ func (c *conn) write(data []byte) {
 }
 
 func (c *conn) closeOnError(err error) {
+	if err == geloop.ErrFdClosed {
+		return
+	}
+
 	fmt.Printf("close conn fd=%d err=%q\n", c.fd, err)
-	c.loop.DetachFile(&geloop.DetachFileRequest{FD: c.fd, CloseFile: true})
+	c.loop.CloseFd(&geloop.CloseFdRequest{Fd: c.fd})
 }

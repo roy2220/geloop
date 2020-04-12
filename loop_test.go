@@ -8,7 +8,7 @@ import (
 )
 
 func TestLoopStop(t *testing.T) {
-	l := new(geloop.Loop).Init()
+	l := new(geloop.Loop).Init(0)
 	err := l.Open()
 	if !assert.NoError(t, err) {
 		t.FailNow()

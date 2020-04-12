@@ -6,7 +6,6 @@ import (
 	"unsafe"
 
 	"github.com/roy2220/geloop/byteslicepool"
-	"github.com/roy2220/geloop/internal/poller"
 )
 
 // WriteFileRequest represents the request about writing a file.
@@ -14,7 +13,7 @@ import (
 // as an argument to *Loop.WriteFile call until be released.
 type WriteFileRequest struct {
 	// The descriptor of the file to write.
-	FD int
+	Fd int
 
 	// The deadline of the request.
 	Deadline time.Time
@@ -25,8 +24,9 @@ type WriteFileRequest struct {
 	//     The request bound to.
 	//
 	// @param err
-	//     ErrClosed - when the loop is closed;
-	//     ErrRequestCanceled - when the request is canceled;
+	//     ErrClosed - when the loop has been closed;
+	//     ErrRequestCanceled - when the request has been
+	//                          canceled;
 	//
 	// @param buffer
 	//     The pointer to shared buffer to put data in.
@@ -43,11 +43,15 @@ type WriteFileRequest struct {
 	//     The request bound to.
 	//
 	// @param err
-	//     ErrClosed - when the loop is closed;
-	//     ErrFileNotAttached - when the file is not attached;
-	//     ErrFileDetached - when the file is detached;
-	//     ErrDeadlineReached - when the deadline is reached;
-	//     ErrRequestCanceled - when the request is canceled;
+	//     ErrClosed - when the loop has been closed;
+	//     ErrInvalidFd - when the fd hasn't yet been adopted
+	//                    or has already been closed;
+	//     ErrFdClosed - when the fd has been closed during
+	//                   the request process;
+	//     ErrRequestCanceled - when the request has been
+	//                          canceled;
+	//     ErrDeadlineReached - when the deadline has been
+	//                          reached;
 	//     the other errors the syscall.Write() returned.
 	//
 	// @param numberOfBytesSent
@@ -72,12 +76,12 @@ func (l *Loop) WriteFile(request1 *WriteFileRequest) uint64 {
 	request1.r.OnTask = func(r *request) bool {
 		r1 := getWriteFileRequest(r)
 
-		if isCompleted := r1.process(); isCompleted {
+		if r1.process() {
 			return true
 		}
 
 		if !r1.Deadline.IsZero() {
-			r1.r.Loop().addAlarm(&r1.r, r1.Deadline)
+			r1.r.AddAlarm(r1.Deadline)
 		}
 
 		return false
@@ -106,13 +110,16 @@ func (l *Loop) WriteFile(request1 *WriteFileRequest) uint64 {
 
 	request1.r.OnCleanup = func(r *request) {
 		r1 := getWriteFileRequest(r)
+		r1.numberOfBytesSent = 0
+		r1.unsentData = nil
+		r1.bufferToReuse = nil
 
 		if f := r1.Cleanup; f != nil {
 			f(r1)
 		}
 	}
 
-	return l.preAddRequest(&request1.r)
+	return request1.r.Process(l)
 }
 
 func (r *WriteFileRequest) process() bool {
@@ -123,7 +130,7 @@ func (r *WriteFileRequest) process() bool {
 
 		for {
 			unsentData := l.writeBuffer[r.numberOfBytesSent:dataSize]
-			n, err := syscall.Write(r.FD, unsentData)
+			n, err := syscall.Write(r.Fd, unsentData)
 
 			if err != nil {
 				switch err {
@@ -133,7 +140,7 @@ func (r *WriteFileRequest) process() bool {
 					r.unsentData = append(byteslicepool.Get(), unsentData...)
 					r.bufferToReuse = r.unsentData
 
-					if err := l.addWatch(&r.r, r.FD, poller.EventWritable); err != nil {
+					if err := r.r.AddWritableWatch(r.Fd); err != nil {
 						r.PostCallback(r, err, r.numberOfBytesSent)
 						return true
 					}
@@ -155,14 +162,14 @@ func (r *WriteFileRequest) process() bool {
 	}
 
 	for {
-		n, err := syscall.Write(r.FD, r.unsentData)
+		n, err := syscall.Write(r.Fd, r.unsentData)
 
 		if err != nil {
 			switch err {
 			case syscall.EINTR:
 				continue
 			case syscall.EAGAIN:
-				if err := l.addWatch(&r.r, r.FD, poller.EventWritable); err != nil {
+				if err := r.r.AddWritableWatch(r.Fd); err != nil {
 					r.PostCallback(r, err, r.numberOfBytesSent)
 					return true
 				}
@@ -178,9 +185,7 @@ func (r *WriteFileRequest) process() bool {
 		r.unsentData = r.unsentData[n:]
 
 		if len(r.unsentData) == 0 {
-			r.unsentData = nil
 			byteslicepool.Put(r.bufferToReuse)
-			r.bufferToReuse = nil
 			r.PostCallback(r, nil, r.numberOfBytesSent)
 			return true
 		}

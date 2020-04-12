@@ -2,6 +2,7 @@ package poller
 
 import (
 	"errors"
+	"log"
 	"sync"
 	"syscall"
 	"time"
@@ -22,30 +23,30 @@ const (
 
 // Poller ...
 type Poller struct {
-	fd            int
-	fileRBTree    intrusive.RBTree
-	dirtyFileList intrusive.List
-	eventsBuffer  []syscall.EpollEvent
+	fd               int
+	watcherRBTree    intrusive.RBTree
+	dirtyWatcherList intrusive.List
+	eventsBuffer     []syscall.EpollEvent
 }
 
 // Init ...
 func (p *Poller) Init() *Poller {
 	p.fd = -1
 
-	p.fileRBTree.Init(
+	p.watcherRBTree.Init(
 		func(rbTreeNode1, rbTreeNode2 *intrusive.RBTreeNode) bool {
-			file1 := (*file)(rbTreeNode1.GetContainer(unsafe.Offsetof(file{}.RBTreeNode)))
-			file2 := (*file)(rbTreeNode2.GetContainer(unsafe.Offsetof(file{}.RBTreeNode)))
-			return file1.FD < file2.FD
+			watcher1 := (*watcher)(rbTreeNode1.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+			watcher2 := (*watcher)(rbTreeNode2.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+			return watcher1.Fd < watcher2.Fd
 		},
 
 		func(rbTreeNode1 *intrusive.RBTreeNode, fd interface{}) int64 {
-			file := (*file)(rbTreeNode1.GetContainer(unsafe.Offsetof(file{}.RBTreeNode)))
-			return int64(file.FD - fd.(int))
+			watcher := (*watcher)(rbTreeNode1.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+			return int64(watcher.Fd - fd.(int))
 		},
 	)
 
-	p.dirtyFileList.Init()
+	p.dirtyWatcherList.Init()
 	p.eventsBuffer = make([]syscall.EpollEvent, initialEventBufferLength)
 	return p
 }
@@ -64,124 +65,101 @@ func (p *Poller) Open() error {
 
 // Close ...
 func (p *Poller) Close(callback func(*Watch)) error {
-	for rbTreeRoot, ok := p.fileRBTree.GetRoot(); ok; rbTreeRoot, ok = p.fileRBTree.GetRoot() {
-		p.fileRBTree.RemoveNode(rbTreeRoot)
-		file := (*file)(rbTreeRoot.GetContainer(unsafe.Offsetof(file{}.RBTreeNode)))
-		var watchLists [numberOfEventTypes]intrusive.List
+	for rbTreeRoot, ok := p.watcherRBTree.GetRoot(); ok; rbTreeRoot, ok = p.watcherRBTree.GetRoot() {
+		p.watcherRBTree.RemoveNode(rbTreeRoot)
+		watcher := (*watcher)(rbTreeRoot.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+		fd := watcher.Fd
 
-		for i := range file.WatchLists {
-			watchLists[i].Init()
-			watchLists[i].AppendNodes(&file.WatchLists[i])
+		if err := doCloseFd(watcher, callback); err != nil {
+			log.Printf("geloop.poller WARN: doCloseFd() failed: fd=%d, err=%q", fd, err)
 		}
-
-		freeFile(file)
-		p.iterateWatches(&watchLists, callback)
 	}
 
-	p.fileRBTree = intrusive.RBTree{}
-	p.dirtyFileList = intrusive.List{}
+	p.watcherRBTree = intrusive.RBTree{}
+	p.dirtyWatcherList = intrusive.List{}
 	return syscall.Close(p.fd)
 }
 
-// AttachFile ...
-func (p *Poller) AttachFile(fd int) {
-	file := allocateFile()
-	file.FD = fd
-
-	for i := range file.WatchLists {
-		file.WatchLists[i].Init()
+// AdoptFd ...
+func (p *Poller) AdoptFd(fd int) {
+	if rbTreeNode, ok := p.watcherRBTree.FindNode(fd); ok {
+		watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+		watcher.FdAdoptionCount++
+		return
 	}
 
-	p.fileRBTree.InsertNode(&file.RBTreeNode)
+	watcher := allocateWatcher()
+	watcher.Fd = fd
+	watcher.FdAdoptionCount = 1
+
+	for i := range watcher.WatchLists {
+		watcher.WatchLists[i].Init()
+	}
+
+	p.watcherRBTree.InsertNode(&watcher.RBTreeNode)
 }
 
-// DetachFile ...
-func (p *Poller) DetachFile(fd int, callback func(*Watch)) (bool, error) {
-	rbTreeNode, ok := p.fileRBTree.FindNode(fd)
+// CloseFd ...
+func (p *Poller) CloseFd(fd int, callback func(*Watch)) error {
+	rbTreeNode, ok := p.watcherRBTree.FindNode(fd)
 
 	if !ok {
-		return false, nil
+		return ErrInvalidFd
 	}
 
-	p.fileRBTree.RemoveNode(rbTreeNode)
-	file := (*file)(rbTreeNode.GetContainer(unsafe.Offsetof(file{}.RBTreeNode)))
+	watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+	watcher.FdAdoptionCount--
 
-	if !file.DirtyListNode.IsReset() {
-		file.DirtyListNode.Remove()
+	if watcher.FdAdoptionCount >= 1 {
+		return nil
 	}
 
-	var watchLists [numberOfEventTypes]intrusive.List
+	p.watcherRBTree.RemoveNode(rbTreeNode)
 
-	for i := range file.WatchLists {
-		watchLists[i].Init()
-		watchLists[i].AppendNodes(&file.WatchLists[i])
+	if !watcher.DirtyListNode.IsReset() {
+		watcher.DirtyListNode.Remove()
 	}
 
-	watchedEventTypes := file.WatchedEventTypes
-	freeFile(file)
-	p.iterateWatches(&watchLists, callback)
-
-	if watchedEventTypes != 0 {
-		if err := syscall.EpollCtl(p.fd, syscall.EPOLL_CTL_DEL, fd, nil); err != nil {
-			return false, err
-		}
-	}
-
-	return true, nil
-}
-
-// HasFile ...
-func (p *Poller) HasFile(fd int) bool {
-	_, ok := p.fileRBTree.FindNode(fd)
-	return ok
+	return doCloseFd(watcher, callback)
 }
 
 // AddWatch ...
 func (p *Poller) AddWatch(watch *Watch, fd int, eventType EventType) error {
-	rbTreeNode, ok := p.fileRBTree.FindNode(fd)
+	rbTreeNode, ok := p.watcherRBTree.FindNode(fd)
 
 	if !ok {
-		return ErrFileNotAttached
+		return ErrInvalidFd
 	}
 
-	file := (*file)(rbTreeNode.GetContainer(unsafe.Offsetof(file{}.RBTreeNode)))
-	watch.file = file
+	watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+	watch.watcher = watcher
 	watch.eventType = eventType
-	watchList := &file.WatchLists[eventType-1]
-	hadNoWatch := watchList.IsEmpty()
+	watchList := &watcher.WatchLists[eventType-1]
+	watchListWasEmpty := watchList.IsEmpty()
 	watchList.AppendNode(&watch.listNode)
 
-	if hadNoWatch && file.DirtyListNode.IsReset() {
-		p.dirtyFileList.AppendNode(&file.DirtyListNode)
+	if watchListWasEmpty && watcher.DirtyListNode.IsReset() {
+		p.dirtyWatcherList.AppendNode(&watcher.DirtyListNode)
 	}
 
 	return nil
 }
 
 // RemoveWatch ...
-func (p *Poller) RemoveWatch(watch *Watch) bool {
-	if watch.listNode.IsReset() {
-		return false
-	}
-
+func (p *Poller) RemoveWatch(watch *Watch) {
 	watch.listNode.Remove()
-	file := watch.file
-	eventType := watch.eventType
+	watcher := watch.watcher
+	watchList := &watcher.WatchLists[watch.eventType-1]
 	*watch = Watch{}
 
-	if file.WatchLists[eventType-1].IsEmpty() && file.DirtyListNode.IsReset() {
-		p.dirtyFileList.AppendNode(&file.DirtyListNode)
+	if watchList.IsEmpty() && watcher.DirtyListNode.IsReset() {
+		p.dirtyWatcherList.AppendNode(&watcher.DirtyListNode)
 	}
-
-	return true
 }
 
-// CheckWatches ...
-func (p *Poller) CheckWatches(deadline time.Time, callback func(*Watch)) error {
-	if err := p.flushFiles(); err != nil {
-		return err
-	}
-
+// ProcessWatches ...
+func (p *Poller) ProcessWatches(deadline time.Time, callback func(*Watch)) error {
+	p.flushWatchers()
 	var timeoutMs int
 
 	if deadline.IsZero() {
@@ -216,29 +194,29 @@ func (p *Poller) CheckWatches(deadline time.Time, callback func(*Watch)) error {
 		events := p.eventsBuffer[:numberOfEvents]
 
 		for _, event := range events {
-			rbTreeNode, ok := p.fileRBTree.FindNode(int(event.Fd))
+			rbTreeNode, ok := p.watcherRBTree.FindNode(int(event.Fd))
 
 			if !ok {
 				continue
 			}
 
-			file := (*file)(rbTreeNode.GetContainer(unsafe.Offsetof(file{}.RBTreeNode)))
+			watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
 			var watchLists [numberOfEventTypes]intrusive.List
 
-			for i := range file.WatchLists {
+			for i := range watcher.WatchLists {
 				watchLists[i].Init()
 			}
 
 			if event.Events&syscall.EPOLLIN != 0 {
-				watchLists[EventReadable-1].AppendNodes(&file.WatchLists[EventReadable-1])
+				watchLists[EventReadable-1].AppendNodes(&watcher.WatchLists[EventReadable-1])
 			}
 
 			if event.Events&syscall.EPOLLOUT != 0 {
-				watchLists[EventWritable-1].AppendNodes(&file.WatchLists[EventWritable-1])
+				watchLists[EventWritable-1].AppendNodes(&watcher.WatchLists[EventWritable-1])
 			}
 
-			p.dirtyFileList.AppendNode(&file.DirtyListNode)
-			p.iterateWatches(&watchLists, callback)
+			p.dirtyWatcherList.AppendNode(&watcher.DirtyListNode)
+			iterateWatches(&watchLists, callback)
 		}
 
 		if numberOfEvents < len(p.eventsBuffer) {
@@ -252,27 +230,27 @@ func (p *Poller) CheckWatches(deadline time.Time, callback func(*Watch)) error {
 	return nil
 }
 
-func (p *Poller) flushFiles() error {
-	for it := p.dirtyFileList.GetNodes(); !it.IsAtEnd(); it.Advance() {
-		file := (*file)(it.Node().GetContainer(unsafe.Offsetof(file{}.DirtyListNode)))
-		file.DirtyListNode = intrusive.ListNode{}
-		oldWatchedEventTypes := file.WatchedEventTypes
-		file.WatchedEventTypes = 0
+func (p *Poller) flushWatchers() {
+	for it := p.dirtyWatcherList.Foreach(); !it.IsAtEnd(); it.Advance() {
+		watcher := (*watcher)(it.Node().GetContainer(unsafe.Offsetof(watcher{}.DirtyListNode)))
+		watcher.DirtyListNode = intrusive.ListNode{}
+		oldWatchedEventTypes := watcher.WatchedEventTypes
+		watcher.WatchedEventTypes = 0
 
-		for i := range file.WatchLists {
-			if !file.WatchLists[i].IsEmpty() {
-				file.WatchedEventTypes |= 1 << i
+		for i := range watcher.WatchLists {
+			if !watcher.WatchLists[i].IsEmpty() {
+				watcher.WatchedEventTypes |= 1 << i
 			}
 		}
 
-		if file.WatchedEventTypes == oldWatchedEventTypes {
+		if watcher.WatchedEventTypes == oldWatchedEventTypes {
 			continue
 		}
 
 		var op int
 		var event syscall.EpollEvent
 
-		if file.WatchedEventTypes == 0 {
+		if watcher.WatchedEventTypes == 0 {
 			op = syscall.EPOLL_CTL_DEL
 		} else {
 			if oldWatchedEventTypes == 0 {
@@ -281,28 +259,79 @@ func (p *Poller) flushFiles() error {
 				op = syscall.EPOLL_CTL_MOD
 			}
 
-			event.Fd = int32(file.FD)
+			event.Fd = int32(watcher.Fd)
 			event.Events = uint32(syscall.EPOLLET & 0xFFFFFFFF)
 
-			if file.WatchedEventTypes&(1<<(EventReadable-1)) != 0 {
+			if watcher.WatchedEventTypes&(1<<(EventReadable-1)) != 0 {
 				event.Events |= syscall.EPOLLIN
 			}
 
-			if file.WatchedEventTypes&(1<<(EventWritable-1)) != 0 {
+			if watcher.WatchedEventTypes&(1<<(EventWritable-1)) != 0 {
 				event.Events |= syscall.EPOLLOUT
 			}
 		}
 
-		if err := syscall.EpollCtl(p.fd, op, file.FD, &event); err != nil {
-			return err
+		if err := syscall.EpollCtl(p.fd, op, watcher.Fd, &event); err != nil {
+			log.Printf("geloop.poller WARN: syscall.EpollCtl() failed: fd=%d, err=%q", watcher.Fd, err)
 		}
 	}
 
-	p.dirtyFileList.Init()
-	return nil
+	p.dirtyWatcherList.Init()
 }
 
-func (p *Poller) iterateWatches(watchLists *[numberOfEventTypes]intrusive.List, callback func(*Watch)) {
+// Watch ...
+type Watch struct {
+	listNode  intrusive.ListNode
+	watcher   *watcher
+	eventType EventType
+}
+
+// IsReset ...
+func (w *Watch) IsReset() bool { return w.listNode.IsReset() }
+
+// EventType ...
+type EventType int
+
+// ErrInvalidFd ...
+var ErrInvalidFd = errors.New("poller: invalid fd")
+
+const initialEventBufferLength = 64
+
+type watcher struct {
+	RBTreeNode        intrusive.RBTreeNode
+	DirtyListNode     intrusive.ListNode
+	Fd                int
+	FdAdoptionCount   int
+	WatchLists        [numberOfEventTypes]intrusive.List
+	WatchedEventTypes int
+}
+
+var watcherPool = sync.Pool{New: func() interface{} { return new(watcher) }}
+
+func allocateWatcher() *watcher {
+	return watcherPool.Get().(*watcher)
+}
+
+func freeWatcher(watcher1 *watcher) {
+	*watcher1 = watcher{}
+	watcherPool.Put(watcher1)
+}
+
+func doCloseFd(watcher *watcher, callback func(*Watch)) error {
+	fd := watcher.Fd
+	var watchLists [numberOfEventTypes]intrusive.List
+
+	for i := range watcher.WatchLists {
+		watchLists[i].Init()
+		watchLists[i].AppendNodes(&watcher.WatchLists[i])
+	}
+
+	freeWatcher(watcher)
+	iterateWatches(&watchLists, callback)
+	return syscall.Close(fd)
+}
+
+func iterateWatches(watchLists *[numberOfEventTypes]intrusive.List, callback func(*Watch)) {
 	for i := range watchLists {
 		watchList := &watchLists[i]
 
@@ -313,41 +342,4 @@ func (p *Poller) iterateWatches(watchLists *[numberOfEventTypes]intrusive.List, 
 			callback(watch)
 		}
 	}
-}
-
-// Watch ...
-type Watch struct {
-	listNode  intrusive.ListNode
-	file      *file
-	eventType EventType
-}
-
-// IsReset ...
-func (w *Watch) IsReset() bool { return w.listNode.IsReset() }
-
-// EventType ...
-type EventType int
-
-// ErrFileNotAttached ...
-var ErrFileNotAttached = errors.New("poller: file not attached")
-
-const initialEventBufferLength = 64
-
-type file struct {
-	RBTreeNode        intrusive.RBTreeNode
-	DirtyListNode     intrusive.ListNode
-	FD                int
-	WatchLists        [numberOfEventTypes]intrusive.List
-	WatchedEventTypes int
-}
-
-var filePool = sync.Pool{New: func() interface{} { return new(file) }}
-
-func allocateFile() *file {
-	return filePool.Get().(*file)
-}
-
-func freeFile(file1 *file) {
-	*file1 = file{}
-	filePool.Put(file1)
 }

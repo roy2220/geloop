@@ -4,8 +4,6 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-
-	"github.com/roy2220/geloop/internal/poller"
 )
 
 // ReadFileRequest represents the request about reading a file.
@@ -13,7 +11,7 @@ import (
 // as an argument to *Loop.ReadFile call until be released.
 type ReadFileRequest struct {
 	// The descriptor of the file to read.
-	FD int
+	Fd int
 
 	// The deadline of the request.
 	Deadline time.Time
@@ -24,26 +22,30 @@ type ReadFileRequest struct {
 	//     The request bound to.
 	//
 	// @param err
-	//     ErrClosed - when the loop is closed;
-	//     ErrFileNotAttached - when the file is not attached;
-	//     ErrFileDetached - when the file is detached;
-	//     ErrDeadlineReached - when the deadline is reached;
+	//     ErrClosed - when the loop has been closed;
+	//     ErrInvalidFd - when the fd hasn't yet been adopted
+	//                    or has already been closed;
+	//     ErrFdClosed - when the fd has been closed during
+	//                   the request process;
+	//     ErrRequestCanceled - when the request has been
+	//                          canceled;
+	//     ErrDeadlineReached - when the deadline has been
+	//                          reached;
 	//     ErrNoMoreData - when there is no more data can be
-	//                     read from the file, the current
-	//                     data must be nil.
-	//     ErrRequestCanceled - when the request is canceled;
+	//                     read from the file;
 	//     the other errors the syscall.Read() returned.
 	//
 	// @param data
 	//     The data received from the file in the shared buffer.
 	//
-	// @param preBuffer
-	//     The reserved shared buffer previous (adjacent) to the the data,
-	//     with a size not smaller than any data ever received.
+	// @param reservedBuffer
+	//     The reserved shared buffer preceding to the the data, with a
+	//     size specified on the loop initialization, for prepending
+	//     custom data to the data for any purposes.
 	//
 	// @return needMoreData
 	//     The boolean value indicates whether the request should be continued.
-	Callback func(request *ReadFileRequest, err error, data []byte, preBuffer []byte) (needMoreData bool)
+	Callback func(request *ReadFileRequest, err error, data []byte, reservedBuffer []byte) (needMoreData bool)
 
 	// The optional function called when the request is released.
 	//
@@ -60,12 +62,12 @@ func (l *Loop) ReadFile(request1 *ReadFileRequest) uint64 {
 	request1.r.OnTask = func(r *request) bool {
 		r1 := getReadFileRequest(r)
 
-		if isCompleted := r1.process(); isCompleted {
+		if r1.process() {
 			return true
 		}
 
 		if !r1.Deadline.IsZero() {
-			r1.r.Loop().addAlarm(&r1.r, r1.Deadline)
+			r1.r.AddAlarm(r1.Deadline)
 		}
 
 		return false
@@ -95,7 +97,7 @@ func (l *Loop) ReadFile(request1 *ReadFileRequest) uint64 {
 		}
 	}
 
-	return l.preAddRequest(&request1.r)
+	return request1.r.Process(l)
 }
 
 func getReadFileRequest(r *request) *ReadFileRequest {
@@ -104,12 +106,12 @@ func getReadFileRequest(r *request) *ReadFileRequest {
 
 func (r *ReadFileRequest) process() bool {
 	l := r.r.Loop()
-	preBuffer := l.readBuffer[:len(l.readBuffer)/2]
-	buffer := l.readBuffer[len(preBuffer):]
+	reservedBuffer := l.readBuffer[:l.reservedReadBufferSize]
+	buffer := l.readBuffer[l.reservedReadBufferSize:]
 	i := 0
 
 	for {
-		n, err := syscall.Read(r.FD, buffer[i:])
+		n, err := syscall.Read(r.Fd, buffer[i:])
 
 		if err != nil || n == 0 {
 			switch err {
@@ -121,11 +123,11 @@ func (r *ReadFileRequest) process() bool {
 				if i == 0 {
 					needMoreData = true
 				} else {
-					needMoreData = r.Callback(r, nil, buffer[:i], preBuffer)
+					needMoreData = r.Callback(r, nil, buffer[:i], reservedBuffer)
 				}
 
 				if needMoreData {
-					if err := l.addWatch(&r.r, r.FD, poller.EventReadable); err != nil {
+					if err := r.r.AddReadableWatch(r.Fd); err != nil {
 						r.Callback(r, err, nil, nil)
 						return true
 					}
@@ -142,7 +144,7 @@ func (r *ReadFileRequest) process() bool {
 				if i == 0 {
 					r.Callback(r, err, nil, nil)
 				} else {
-					needMoreData := r.Callback(r, nil, buffer[:i], preBuffer)
+					needMoreData := r.Callback(r, nil, buffer[:i], reservedBuffer)
 
 					if needMoreData {
 						r.Callback(r, err, nil, nil)
@@ -156,9 +158,9 @@ func (r *ReadFileRequest) process() bool {
 		i += n
 
 		if i == len(buffer) {
-			l.readBuffer = make([]byte, 2*len(l.readBuffer))
-			preBuffer = l.readBuffer[:len(l.readBuffer)/2]
-			temp := l.readBuffer[len(preBuffer):]
+			l.readBuffer = make([]byte, l.reservedReadBufferSize+2*len(buffer))
+			reservedBuffer = l.readBuffer[:l.reservedReadBufferSize]
+			temp := l.readBuffer[l.reservedReadBufferSize:]
 			copy(temp, buffer)
 			buffer = temp
 		}

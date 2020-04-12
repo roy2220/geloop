@@ -10,7 +10,7 @@ import (
 )
 
 func TestLoopReadFile(t *testing.T) {
-	l := new(geloop.Loop).Init()
+	l := new(geloop.Loop).Init(333)
 	err := l.Open()
 	if !assert.NoError(t, err) {
 		t.FailNow()
@@ -28,59 +28,62 @@ func TestLoopReadFile(t *testing.T) {
 	go func() {
 		err := make(chan error, 1)
 		l.ReadFile(&geloop.ReadFileRequest{
-			FD: fds[0],
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, preBuffer []byte) bool {
+			Fd: fds[0],
+			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, reservedBuffer []byte) bool {
 				err <- err2
 				return false
 			},
 		})
-		assert.EqualError(t, <-err, geloop.ErrFileNotAttached.Error())
+		assert.EqualError(t, <-err, geloop.ErrInvalidFd.Error())
 		l.Stop()
 	}()
 	l.Run()
 
 	go func() {
+		fd, err2 := syscall.Dup(fds[0])
+		if !assert.NoError(t, err2) {
+			t.FailNow()
+		}
 		err := make(chan error, 1)
-		l.AttachFile(&geloop.AttachFileRequest{
-			FD: fds[0],
-			Callback: func(_ *geloop.AttachFileRequest, err2 error, _ bool) {
+		l.AdoptFd(&geloop.AdoptFdRequest{
+			Fd: fd,
+			Callback: func(_ *geloop.AdoptFdRequest, err2 error) {
 				err <- err2
 			},
 		})
 		assert.NoError(t, <-err)
 		l.ReadFile(&geloop.ReadFileRequest{
-			FD:       fds[0],
+			Fd:       fd,
 			Deadline: time.Now().Add(time.Second),
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, preBuffer []byte) bool {
+			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, reservedBuffer []byte) bool {
 				err <- err2
 				return false
 			},
 		})
 		go func() {
 			time.Sleep(time.Second / 2)
-			l.DetachFile(&geloop.DetachFileRequest{
-				FD:       fds[0],
-				Callback: func(_ *geloop.DetachFileRequest, err2 error, _ bool) {},
+			l.CloseFd(&geloop.CloseFdRequest{
+				Fd: fd,
 			})
 		}()
-		assert.EqualError(t, <-err, geloop.ErrFileDetached.Error())
-		l.AttachFile(&geloop.AttachFileRequest{
-			FD: fds[0],
-			Callback: func(_ *geloop.AttachFileRequest, err2 error, _ bool) {
-				err <- err2
-			},
-		})
-		assert.NoError(t, <-err)
+		assert.EqualError(t, <-err, geloop.ErrFdClosed.Error())
 		l.Stop()
 	}()
 	l.Run()
 
 	go func() {
 		err := make(chan error, 1)
+		l.AdoptFd(&geloop.AdoptFdRequest{
+			Fd: fds[0],
+			Callback: func(_ *geloop.AdoptFdRequest, err2 error) {
+				err <- err2
+			},
+		})
+		assert.NoError(t, <-err)
 		l.ReadFile(&geloop.ReadFileRequest{
-			FD:       fds[0],
+			Fd:       fds[0],
 			Deadline: time.Now().Add(time.Second / 2),
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, preBuffer []byte) bool {
+			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, reservedBuffer []byte) bool {
 				err <- err2
 				return false
 			},
@@ -99,12 +102,12 @@ func TestLoopReadFile(t *testing.T) {
 		}
 		err := make(chan error, 1)
 		l.ReadFile(&geloop.ReadFileRequest{
-			FD:       fds[0],
+			Fd:       fds[0],
 			Deadline: time.Now().Add(time.Second),
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, preBuffer []byte) bool {
+			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, reservedBuffer []byte) bool {
 				err <- err2
 				assert.Equal(t, buf, data)
-				assert.GreaterOrEqual(t, len(preBuffer), len(data))
+				assert.Equal(t, 333, len(reservedBuffer))
 				return false
 			},
 		})
@@ -123,9 +126,9 @@ func TestLoopReadFile(t *testing.T) {
 	go func() {
 		err := make(chan error, 1)
 		rid := l.ReadFile(&geloop.ReadFileRequest{
-			FD:       fds[0],
+			Fd:       fds[0],
 			Deadline: time.Now().Add(time.Second),
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data2 []byte, preBuffer []byte) bool {
+			Callback: func(_ *geloop.ReadFileRequest, err2 error, data2 []byte, reservedBuffer []byte) bool {
 				err <- err2
 				return true
 			},
@@ -148,14 +151,14 @@ func TestLoopReadFile(t *testing.T) {
 		data := []byte(nil)
 		err := make(chan error, 1)
 		l.ReadFile(&geloop.ReadFileRequest{
-			FD:       fds[0],
-			Deadline: time.Now().Add(time.Second),
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data2 []byte, preBuffer []byte) bool {
+			Fd: fds[0],
+			Callback: func(_ *geloop.ReadFileRequest, err2 error, data2 []byte, reservedBuffer []byte) bool {
 				if err2 != nil {
 					err <- err2
+					return false
 				}
 				data = append(data, data2...)
-				assert.GreaterOrEqual(t, len(preBuffer), len(data2))
+				assert.Equal(t, 333, len(reservedBuffer))
 				return true
 			},
 		})

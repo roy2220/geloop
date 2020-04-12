@@ -3,7 +3,6 @@ package geloop_test
 import (
 	"net"
 	"sync"
-	"syscall"
 	"testing"
 
 	"github.com/roy2220/geloop"
@@ -11,7 +10,7 @@ import (
 )
 
 func TestLoopAcceptSockets(t *testing.T) {
-	l := new(geloop.Loop).Init()
+	l := new(geloop.Loop).Init(0)
 	err := l.Open()
 	if !assert.NoError(t, err) {
 		t.FailNow()
@@ -22,7 +21,7 @@ func TestLoopAcceptSockets(t *testing.T) {
 		ListenAddress: "127.0.0.1:8888",
 		Callback: func(request *geloop.AcceptSocketsRequest, err error, fd int) {
 			if err == nil {
-				err = syscall.Close(fd)
+				l.CloseFd(&geloop.CloseFdRequest{Fd: fd})
 				assert.NoError(t, err, "fd=%d", fd)
 			} else {
 				err2 <- err
