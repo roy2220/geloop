@@ -51,7 +51,8 @@ func (l *Loop) Open() error {
 	return nil
 }
 
-// Close closes the loop.
+// Close closes the loop. All file descriptors adopted in the
+// loop will automatically be closed at the same time.
 func (l *Loop) Close() error {
 	if err := l.worker.Close(func(task *worker.Task) {
 		request := getRequestByTask(task)

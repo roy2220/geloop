@@ -6,7 +6,8 @@ import "unsafe"
 // The request should not be modified since be passed
 // as an argument to *Loop.CloseFd call until be released.
 type CloseFdRequest struct {
-	// The file descriptor to close.
+	// The file descriptor to close. All file descriptors adopted in a
+	// loop will automatically be closed when the loop is closed.
 	Fd int
 
 	// The optional function called when the request is completed.

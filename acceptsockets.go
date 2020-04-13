@@ -16,7 +16,7 @@ type AcceptSocketsRequest struct {
 	// The address listened on.
 	ListenAddress string
 
-	// Adopt file descriptors of sockets accepted to the current loop.
+	// Adopt the file descriptors of sockets accepted to the current loop.
 	AdoptFds bool
 
 	// The function called when there is a socket accepted.
@@ -45,7 +45,7 @@ type AcceptSocketsRequest struct {
 	listenFdIsAdopted bool
 }
 
-// AcceptSockets requests to accept sockets to attach to the given loop.
+// AcceptSockets requests to accept sockets.
 // It returns the request id for cancellation.
 func (l *Loop) AcceptSockets(request1 *AcceptSocketsRequest) (uint64, error) {
 	listenFd, err := doListen(request1.NetworkName, request1.ListenAddress)
