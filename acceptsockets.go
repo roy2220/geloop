@@ -16,6 +16,9 @@ type AcceptSocketsRequest struct {
 	// The address listened on.
 	ListenAddress string
 
+	// Adopt file descriptors of sockets accepted to the current loop.
+	AdoptFds bool
+
 	// The function called when there is a socket accepted.
 	//
 	// @param request
@@ -80,7 +83,10 @@ func (l *Loop) AcceptSockets(request1 *AcceptSocketsRequest) (uint64, error) {
 				}
 			}
 
-			r1.r.Loop().adoptFd(fd)
+			if r1.AdoptFds {
+				r1.r.Loop().adoptFd(fd)
+			}
+
 			r1.Callback(r1, nil, fd)
 		}
 	}

@@ -49,6 +49,7 @@ func runEchoServer(ctx context.Context) {
 	requestID, err := loop.AcceptSockets(&geloop.AcceptSocketsRequest{
 		NetworkName:   "tcp4",
 		ListenAddress: listenAddress,
+		AdoptFds:      true,
 		Callback: func(request *geloop.AcceptSocketsRequest, err error, fd int) {
 			if err != nil {
 				fmt.Printf("accept sockets error: %v", err)

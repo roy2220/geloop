@@ -20,10 +20,7 @@ func TestLoopAcceptSockets(t *testing.T) {
 		NetworkName:   "tcp4",
 		ListenAddress: "127.0.0.1:8888",
 		Callback: func(request *geloop.AcceptSocketsRequest, err error, fd int) {
-			if err == nil {
-				l.CloseFd(&geloop.CloseFdRequest{Fd: fd})
-				assert.NoError(t, err, "fd=%d", fd)
-			} else {
+			if err != nil {
 				err2 <- err
 				close(err2)
 				l.Stop()
