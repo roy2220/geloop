@@ -32,7 +32,6 @@ func TestLoopWriteFile(t *testing.T) {
 	go func() {
 		err := make(chan error, 1)
 		l.WriteFile(&geloop.WriteFileRequest{
-			Fd: fds[1],
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				*buffer = []byte{0}
 				return 1
@@ -41,7 +40,7 @@ func TestLoopWriteFile(t *testing.T) {
 				err <- err2
 			},
 		})
-		assert.EqualError(t, <-err, geloop.ErrInvalidFd.Error())
+		assert.EqualError(t, <-err, geloop.ErrInvalidWatcherID.Error())
 		l.Stop()
 	}()
 	l.Run()
@@ -52,16 +51,18 @@ func TestLoopWriteFile(t *testing.T) {
 			t.FailNow()
 		}
 		err := make(chan error, 1)
+		var watcherID int64
 		l.AdoptFd(&geloop.AdoptFdRequest{
 			Fd: fd,
-			Callback: func(_ *geloop.AdoptFdRequest, err2 error) {
+			Callback: func(_ *geloop.AdoptFdRequest, err2 error, watcherID2 int64) {
+				watcherID = watcherID2
 				err <- err2
 			},
 		})
 		assert.NoError(t, <-err)
 		l.WriteFile(&geloop.WriteFileRequest{
-			Fd:       fd,
-			Deadline: time.Now().Add(time.Second),
+			WatcherID: watcherID,
+			Deadline:  time.Now().Add(time.Second),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				*buffer = []byte{0}
 				return 1
@@ -73,7 +74,7 @@ func TestLoopWriteFile(t *testing.T) {
 		go func() {
 			time.Sleep(time.Second / 2)
 			l.CloseFd(&geloop.CloseFdRequest{
-				Fd: fd,
+				WatcherID: watcherID,
 			})
 		}()
 		assert.EqualError(t, <-err, geloop.ErrFdClosed.Error())
@@ -81,18 +82,20 @@ func TestLoopWriteFile(t *testing.T) {
 	}()
 	l.Run()
 
+	var watcherID int64
 	go func() {
 		err := make(chan error, 1)
 		l.AdoptFd(&geloop.AdoptFdRequest{
 			Fd: fds[1],
-			Callback: func(_ *geloop.AdoptFdRequest, err2 error) {
+			Callback: func(_ *geloop.AdoptFdRequest, err2 error, watcherID2 int64) {
+				watcherID = watcherID2
 				err <- err2
 			},
 		})
 		assert.NoError(t, <-err)
 		l.WriteFile(&geloop.WriteFileRequest{
-			Fd:       fds[1],
-			Deadline: time.Now().Add(time.Second / 2),
+			WatcherID: watcherID,
+			Deadline:  time.Now().Add(time.Second / 2),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				*buffer = []byte{0}
 				return 1
@@ -110,9 +113,35 @@ func TestLoopWriteFile(t *testing.T) {
 
 	go func() {
 		err := make(chan error, 2)
+		rid := l.WriteFile(&geloop.WriteFileRequest{
+			WatcherID: watcherID,
+			Deadline:  time.Now().Add(time.Second),
+			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
+				err <- err2
+				*buffer = make([]byte, 1024*1024)
+				return len(*buffer)
+			},
+			PostCallback: func(_ *geloop.WriteFileRequest, err2 error, n int) {
+				err <- err2
+				return
+			},
+		})
+		syscall.Read(fds[0], make([]byte, 4096))
+		assert.NoError(t, <-err)
+		go func() {
+			l.CancelRequest(rid)
+			l.CancelRequest(rid)
+		}()
+		assert.EqualError(t, <-err, geloop.ErrRequestCanceled.Error())
+		l.Stop()
+	}()
+	l.Run()
+
+	go func() {
+		err := make(chan error, 2)
 		l.WriteFile(&geloop.WriteFileRequest{
-			Fd:       fds[1],
-			Deadline: time.Now().Add(time.Second),
+			WatcherID: watcherID,
+			Deadline:  time.Now().Add(time.Second),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				err <- err2
 				*buffer = []byte{0}
@@ -144,7 +173,7 @@ func TestLoopWriteFile(t *testing.T) {
 		}
 		err := make(chan error, 2)
 		l.WriteFile(&geloop.WriteFileRequest{
-			Fd: fds[1],
+			WatcherID: watcherID,
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				err <- err2
 				*buffer = data
@@ -184,8 +213,8 @@ func TestLoopWriteFile(t *testing.T) {
 		}
 		err := make(chan error, 2)
 		l.WriteFile(&geloop.WriteFileRequest{
-			Fd:       fds[1],
-			Deadline: time.Now().Add(time.Second / 2),
+			WatcherID: watcherID,
+			Deadline:  time.Now().Add(time.Second / 2),
 			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
 				err <- err2
 				*buffer = data
@@ -213,32 +242,6 @@ func TestLoopWriteFile(t *testing.T) {
 		}()
 		assert.NoError(t, <-err)
 		assert.EqualError(t, <-err, geloop.ErrDeadlineReached.Error())
-		l.Stop()
-	}()
-	l.Run()
-
-	go func() {
-		err := make(chan error, 2)
-		rid := l.WriteFile(&geloop.WriteFileRequest{
-			Fd:       fds[1],
-			Deadline: time.Now().Add(time.Second),
-			PreCallback: func(_ *geloop.WriteFileRequest, err2 error, buffer *[]byte) int {
-				err <- err2
-				*buffer = make([]byte, 1024*1024)
-				return len(*buffer)
-			},
-			PostCallback: func(_ *geloop.WriteFileRequest, err2 error, n int) {
-				err <- err2
-				return
-			},
-		})
-		syscall.Read(fds[0], make([]byte, 4096))
-		assert.NoError(t, <-err)
-		go func() {
-			l.CancelRequest(rid)
-			l.CancelRequest(rid)
-		}()
-		assert.EqualError(t, <-err, geloop.ErrRequestCanceled.Error())
 		l.Stop()
 	}()
 	l.Run()

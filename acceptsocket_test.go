@@ -1,6 +1,7 @@
 package geloop_test
 
 import (
+	"net"
 	"syscall"
 	"testing"
 	"time"
@@ -9,28 +10,22 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestLoopReadFile(t *testing.T) {
+func TestLoopAcceptSocket(t *testing.T) {
 	l := new(geloop.Loop).Init(333)
 	err := l.Open()
 	if !assert.NoError(t, err) {
 		t.FailNow()
 	}
-	var fds [2]int
-	err = syscall.Pipe2(fds[:], syscall.O_CLOEXEC)
-	if !assert.NoError(t, err) {
-		t.FailNow()
-	}
-	err = syscall.SetNonblock(fds[0], true)
+	fd, err := geloop.Listen("tcp", "127.0.0.1:8888")
 	if !assert.NoError(t, err) {
 		t.FailNow()
 	}
 
 	go func() {
 		err := make(chan error, 1)
-		l.ReadFile(&geloop.ReadFileRequest{
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, reservedBuffer []byte) bool {
+		l.AcceptSocket(&geloop.AcceptSocketRequest{
+			Callback: func(_ *geloop.AcceptSocketRequest, err2 error, newFd int) {
 				err <- err2
-				return false
 			},
 		})
 		assert.EqualError(t, <-err, geloop.ErrInvalidWatcherID.Error())
@@ -39,26 +34,24 @@ func TestLoopReadFile(t *testing.T) {
 	l.Run()
 
 	go func() {
-		fd, err2 := syscall.Dup(fds[0])
+		fd2, err2 := syscall.Dup(fd)
 		if !assert.NoError(t, err2) {
 			t.FailNow()
 		}
 		err := make(chan error, 1)
 		var watcherID int64
 		l.AdoptFd(&geloop.AdoptFdRequest{
-			Fd: fd,
+			Fd: fd2,
 			Callback: func(_ *geloop.AdoptFdRequest, err2 error, watcherID2 int64) {
 				watcherID = watcherID2
 				err <- err2
 			},
 		})
 		assert.NoError(t, <-err)
-		l.ReadFile(&geloop.ReadFileRequest{
+		l.AcceptSocket(&geloop.AcceptSocketRequest{
 			WatcherID: watcherID,
-			Deadline:  time.Now().Add(time.Second),
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, reservedBuffer []byte) bool {
+			Callback: func(_ *geloop.AcceptSocketRequest, err2 error, newFd int) {
 				err <- err2
-				return false
 			},
 		})
 		go func() {
@@ -76,19 +69,18 @@ func TestLoopReadFile(t *testing.T) {
 	go func() {
 		err := make(chan error, 1)
 		l.AdoptFd(&geloop.AdoptFdRequest{
-			Fd: fds[0],
+			Fd: fd,
 			Callback: func(_ *geloop.AdoptFdRequest, err2 error, watcherID2 int64) {
 				watcherID = watcherID2
 				err <- err2
 			},
 		})
 		assert.NoError(t, <-err)
-		l.ReadFile(&geloop.ReadFileRequest{
+		l.AcceptSocket(&geloop.AcceptSocketRequest{
 			WatcherID: watcherID,
 			Deadline:  time.Now().Add(time.Second / 2),
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, reservedBuffer []byte) bool {
+			Callback: func(_ *geloop.AcceptSocketRequest, err2 error, newFd int) {
 				err <- err2
-				return false
 			},
 		})
 		t0 := time.Now()
@@ -100,12 +92,11 @@ func TestLoopReadFile(t *testing.T) {
 
 	go func() {
 		err := make(chan error, 1)
-		rid := l.ReadFile(&geloop.ReadFileRequest{
+		rid := l.AcceptSocket(&geloop.AcceptSocketRequest{
 			WatcherID: watcherID,
 			Deadline:  time.Now().Add(time.Second),
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data2 []byte, reservedBuffer []byte) bool {
+			Callback: func(_ *geloop.AcceptSocketRequest, err2 error, newFd int) {
 				err <- err2
-				return true
 			},
 		})
 		go func() {
@@ -119,63 +110,24 @@ func TestLoopReadFile(t *testing.T) {
 	l.Run()
 
 	go func() {
-		buf := make([]byte, 4096)
-		for i := range buf {
-			buf[i] = uint8(i % 256)
-		}
 		err := make(chan error, 1)
-		l.ReadFile(&geloop.ReadFileRequest{
+		l.AcceptSocket(&geloop.AcceptSocketRequest{
 			WatcherID: watcherID,
 			Deadline:  time.Now().Add(time.Second),
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data []byte, reservedBuffer []byte) bool {
+			Callback: func(_ *geloop.AcceptSocketRequest, err2 error, newFd int) {
+				if assert.LessOrEqual(t, 0, newFd) {
+					syscall.Close(newFd)
+				}
 				err <- err2
-				assert.Equal(t, buf, data)
-				assert.Equal(t, 333, len(reservedBuffer))
-				return false
 			},
 		})
 		go func() {
 			time.Sleep(time.Second / 2)
-			n, err := syscall.Write(fds[1], buf)
-			if assert.NoError(t, err) {
-				assert.Equal(t, len(buf), n)
-			}
+			c, err := net.Dial("tcp", "127.0.0.1:8888")
+			assert.NoError(t, err)
+			c.Close()
 		}()
 		assert.NoError(t, <-err)
-		l.Stop()
-	}()
-	l.Run()
-
-	go func() {
-		buf := make([]byte, 1024*1024)
-		for i := range buf {
-			buf[i] = uint8(i % 256)
-		}
-		data := []byte(nil)
-		err := make(chan error, 1)
-		l.ReadFile(&geloop.ReadFileRequest{
-			WatcherID: watcherID,
-			Callback: func(_ *geloop.ReadFileRequest, err2 error, data2 []byte, reservedBuffer []byte) bool {
-				if err2 != nil {
-					err <- err2
-					return false
-				}
-				data = append(data, data2...)
-				assert.Equal(t, 333, len(reservedBuffer))
-				return true
-			},
-		})
-		go func() {
-			time.Sleep(time.Second / 2)
-			n, err := syscall.Write(fds[1], buf)
-			if assert.NoError(t, err) {
-				assert.Equal(t, len(buf), n)
-				err = syscall.Close(fds[1])
-				assert.NoError(t, err)
-			}
-		}()
-		assert.EqualError(t, <-err, geloop.ErrNoMoreData.Error())
-		assert.Equal(t, buf, data)
 		l.Stop()
 	}()
 	l.Run()

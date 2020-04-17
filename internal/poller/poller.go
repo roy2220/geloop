@@ -26,6 +26,7 @@ type Poller struct {
 	fd               int
 	watcherRBTree    intrusive.RBTree
 	dirtyWatcherList intrusive.List
+	watcherIDBuffer  int64
 	eventsBuffer     []syscall.EpollEvent
 }
 
@@ -37,12 +38,12 @@ func (p *Poller) Init() *Poller {
 		func(rbTreeNode1, rbTreeNode2 *intrusive.RBTreeNode) bool {
 			watcher1 := (*watcher)(rbTreeNode1.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
 			watcher2 := (*watcher)(rbTreeNode2.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
-			return watcher1.Fd < watcher2.Fd
+			return watcher1.ID < watcher2.ID
 		},
 
-		func(rbTreeNode1 *intrusive.RBTreeNode, fd interface{}) int64 {
+		func(rbTreeNode1 *intrusive.RBTreeNode, watcherID interface{}) int64 {
 			watcher := (*watcher)(rbTreeNode1.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
-			return int64(watcher.Fd - fd.(int))
+			return watcher.ID - *(watcherID.(*int64))
 		},
 	)
 
@@ -66,12 +67,11 @@ func (p *Poller) Open() error {
 // Close ...
 func (p *Poller) Close(callback func(*Watch)) error {
 	for rbTreeRoot, ok := p.watcherRBTree.GetRoot(); ok; rbTreeRoot, ok = p.watcherRBTree.GetRoot() {
-		p.watcherRBTree.RemoveNode(rbTreeRoot)
 		watcher := (*watcher)(rbTreeRoot.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
 		fd := watcher.Fd
 
-		if err := doCloseFd(watcher, callback); err != nil {
-			log.Printf("geloop.poller WARN: doCloseFd() failed: fd=%d, err=%q", fd, err)
+		if err := p.doCloseFd(watcher, callback); err != nil {
+			log.Printf("geloop.poller WARN: syscall.Close() failed: fd=%d, err=%q", fd, err)
 		}
 	}
 
@@ -81,16 +81,10 @@ func (p *Poller) Close(callback func(*Watch)) error {
 }
 
 // AdoptFd ...
-func (p *Poller) AdoptFd(fd int) {
-	if rbTreeNode, ok := p.watcherRBTree.FindNode(fd); ok {
-		watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
-		watcher.FdAdoptionCount++
-		return
-	}
-
+func (p *Poller) AdoptFd(fd int, watcherID int64) {
 	watcher := allocateWatcher()
+	watcher.ID = watcherID
 	watcher.Fd = fd
-	watcher.FdAdoptionCount = 1
 
 	for i := range watcher.WatchLists {
 		watcher.WatchLists[i].Init()
@@ -100,38 +94,30 @@ func (p *Poller) AdoptFd(fd int) {
 }
 
 // CloseFd ...
-func (p *Poller) CloseFd(fd int, callback func(*Watch)) error {
-	rbTreeNode, ok := p.watcherRBTree.FindNode(fd)
+func (p *Poller) CloseFd(watcherID int64, callback func(*Watch)) error {
+	watcher, err := p.getWatcher(watcherID)
 
-	if !ok {
-		return ErrInvalidFd
+	if err != nil {
+		return err
 	}
 
-	watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
-	watcher.FdAdoptionCount--
+	return p.doCloseFd(watcher, callback)
+}
 
-	if watcher.FdAdoptionCount >= 1 {
-		return nil
+// GetFd ...
+func (p *Poller) GetFd(watcherID int64) (int, error) {
+	watcher, err := p.getWatcher(watcherID)
+
+	if err != nil {
+		return -1, err
 	}
 
-	p.watcherRBTree.RemoveNode(rbTreeNode)
-
-	if !watcher.DirtyListNode.IsReset() {
-		watcher.DirtyListNode.Remove()
-	}
-
-	return doCloseFd(watcher, callback)
+	return watcher.Fd, nil
 }
 
 // AddWatch ...
-func (p *Poller) AddWatch(watch *Watch, fd int, eventType EventType) error {
-	rbTreeNode, ok := p.watcherRBTree.FindNode(fd)
-
-	if !ok {
-		return ErrInvalidFd
-	}
-
-	watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+func (p *Poller) AddWatch(watch *Watch, watcherID int64, eventType EventType) {
+	watcher, _ := p.getWatcher(watcherID)
 	watch.watcher = watcher
 	watch.eventType = eventType
 	watchList := &watcher.WatchLists[eventType-1]
@@ -141,14 +127,17 @@ func (p *Poller) AddWatch(watch *Watch, fd int, eventType EventType) error {
 	if watchListWasEmpty && watcher.DirtyListNode.IsReset() {
 		p.dirtyWatcherList.AppendNode(&watcher.DirtyListNode)
 	}
-
-	return nil
 }
 
 // RemoveWatch ...
 func (p *Poller) RemoveWatch(watch *Watch) {
 	watch.listNode.Remove()
 	watcher := watch.watcher
+
+	if watcher == nil {
+		return
+	}
+
 	watchList := &watcher.WatchLists[watch.eventType-1]
 	*watch = Watch{}
 
@@ -172,6 +161,8 @@ func (p *Poller) ProcessWatches(deadline time.Time, callback func(*Watch)) error
 		}
 	}
 
+	watchList := new(intrusive.List).Init()
+
 	for {
 		numberOfEvents, err := syscall.EpollWait(p.fd, p.eventsBuffer, timeoutMs)
 
@@ -194,29 +185,19 @@ func (p *Poller) ProcessWatches(deadline time.Time, callback func(*Watch)) error
 		events := p.eventsBuffer[:numberOfEvents]
 
 		for _, event := range events {
-			rbTreeNode, ok := p.watcherRBTree.FindNode(int(event.Fd))
-
-			if !ok {
-				continue
-			}
-
+			p.watcherIDBuffer = eventGetWatcherID(&event)
+			rbTreeNode, _ := p.watcherRBTree.FindNode(&p.watcherIDBuffer)
 			watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
-			var watchLists [numberOfEventTypes]intrusive.List
 
-			for i := range watcher.WatchLists {
-				watchLists[i].Init()
+			if event.Events&(syscall.EPOLLIN|syscall.EPOLLERR|syscall.EPOLLHUP) != 0 {
+				watchList.AppendNodes(&watcher.WatchLists[EventReadable-1])
 			}
 
-			if event.Events&syscall.EPOLLIN != 0 {
-				watchLists[EventReadable-1].AppendNodes(&watcher.WatchLists[EventReadable-1])
-			}
-
-			if event.Events&syscall.EPOLLOUT != 0 {
-				watchLists[EventWritable-1].AppendNodes(&watcher.WatchLists[EventWritable-1])
+			if event.Events&(syscall.EPOLLOUT|syscall.EPOLLERR|syscall.EPOLLHUP) != 0 {
+				watchList.AppendNodes(&watcher.WatchLists[EventWritable-1])
 			}
 
 			p.dirtyWatcherList.AppendNode(&watcher.DirtyListNode)
-			iterateWatches(&watchLists, callback)
 		}
 
 		if numberOfEvents < len(p.eventsBuffer) {
@@ -227,7 +208,45 @@ func (p *Poller) ProcessWatches(deadline time.Time, callback func(*Watch)) error
 		timeoutMs = 0
 	}
 
+	fireWatches(watchList, callback)
 	return nil
+}
+
+func (p *Poller) getWatcher(watcherID int64) (*watcher, error) {
+	p.watcherIDBuffer = watcherID
+	rbTreeNode, ok := p.watcherRBTree.FindNode(&p.watcherIDBuffer)
+
+	if !ok {
+		return nil, ErrInvalidWatcherID
+	}
+
+	watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+	return watcher, nil
+}
+
+func (p *Poller) doCloseFd(watcher *watcher, callback func(*Watch)) error {
+	p.watcherRBTree.RemoveNode(&watcher.RBTreeNode)
+
+	if !watcher.DirtyListNode.IsReset() {
+		watcher.DirtyListNode.Remove()
+	}
+
+	fd := watcher.Fd
+	watchList := new(intrusive.List).Init()
+
+	for i := range watcher.WatchLists {
+		watchList.AppendNodes(&watcher.WatchLists[i])
+	}
+
+	if watcher.WatchedEventTypes != 0 {
+		if err := syscall.EpollCtl(p.fd, syscall.EPOLL_CTL_DEL, watcher.Fd, nil); err != nil {
+			log.Printf("geloop.poller WARN: syscall.EpollCtl() failed: fd=%d, err=%q", watcher.Fd, err)
+		}
+	}
+
+	freeWatcher(watcher)
+	fireWatches(watchList, callback)
+	return syscall.Close(fd)
 }
 
 func (p *Poller) flushWatchers() {
@@ -259,8 +278,8 @@ func (p *Poller) flushWatchers() {
 				op = syscall.EPOLL_CTL_MOD
 			}
 
-			event.Fd = int32(watcher.Fd)
-			event.Events = uint32(syscall.EPOLLET & 0xFFFFFFFF)
+			eventSetWatcherID(&event, watcher.ID)
+			event.Events = 0
 
 			if watcher.WatchedEventTypes&(1<<(EventReadable-1)) != 0 {
 				event.Events |= syscall.EPOLLIN
@@ -292,14 +311,15 @@ func (w *Watch) IsReset() bool { return w.listNode.IsReset() }
 // EventType ...
 type EventType int
 
-// ErrInvalidFd ...
-var ErrInvalidFd = errors.New("poller: invalid fd")
+// ErrInvalidWatcherID ...
+var ErrInvalidWatcherID = errors.New("poller: invalid watcher id")
 
 const initialEventBufferLength = 64
 
 type watcher struct {
 	RBTreeNode        intrusive.RBTreeNode
 	DirtyListNode     intrusive.ListNode
+	ID                int64
 	Fd                int
 	FdAdoptionCount   int
 	WatchLists        [numberOfEventTypes]intrusive.List
@@ -317,29 +337,25 @@ func freeWatcher(watcher1 *watcher) {
 	watcherPool.Put(watcher1)
 }
 
-func doCloseFd(watcher *watcher, callback func(*Watch)) error {
-	fd := watcher.Fd
-	var watchLists [numberOfEventTypes]intrusive.List
-
-	for i := range watcher.WatchLists {
-		watchLists[i].Init()
-		watchLists[i].AppendNodes(&watcher.WatchLists[i])
+func fireWatches(watchList *intrusive.List, callback func(*Watch)) {
+	for it := watchList.Foreach(); !it.IsAtEnd(); it.Advance() {
+		watch := (*Watch)(it.Node().GetContainer(unsafe.Offsetof(Watch{}.listNode)))
+		watch.watcher = nil
 	}
 
-	freeWatcher(watcher)
-	iterateWatches(&watchLists, callback)
-	return syscall.Close(fd)
+	for listHead := watchList.Head(); !listHead.IsNull(watchList); listHead = watchList.Head() {
+		listHead.Remove()
+		watch := (*Watch)(listHead.GetContainer(unsafe.Offsetof(Watch{}.listNode)))
+		*watch = Watch{}
+		callback(watch)
+	}
 }
 
-func iterateWatches(watchLists *[numberOfEventTypes]intrusive.List, callback func(*Watch)) {
-	for i := range watchLists {
-		watchList := &watchLists[i]
+func eventSetWatcherID(e *syscall.EpollEvent, watcherID int64) {
+	e.Fd = int32(watcherID >> 32)
+	e.Pad = int32(watcherID)
+}
 
-		for listHead := watchList.Head(); !listHead.IsNull(watchList); listHead = watchList.Head() {
-			listHead.Remove()
-			watch := (*Watch)(listHead.GetContainer(unsafe.Offsetof(Watch{}.listNode)))
-			*watch = Watch{}
-			callback(watch)
-		}
-	}
+func eventGetWatcherID(e *syscall.EpollEvent) int64 {
+	return (int64(e.Fd) << 32) | int64(e.Pad)
 }

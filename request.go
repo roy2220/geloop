@@ -4,37 +4,37 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/roy2220/intrusive"
+
 	"github.com/roy2220/geloop/internal/poller"
 	"github.com/roy2220/geloop/internal/timer"
 	"github.com/roy2220/geloop/internal/worker"
 )
 
 type request struct {
-	OnTask    func(r *request) (isCompleted bool)
-	OnWatch   func(r *request) (isCompleted bool)
-	OnAlarm   func(r *request) (isCompleted bool)
-	OnError   func(r *request, err error)
-	OnCleanup func(r *request)
+	RBTreeNode intrusive.RBTreeNode
+	Task       worker.Task
+	OnTask     func(r *request) (isCompleted bool)
+	Watch      poller.Watch
+	OnWatch    func(r *request) (isCompleted bool)
+	Alarm      timer.Alarm
+	OnAlarm    func(r *request) (isCompleted bool)
+	OnError    func(r *request, err error)
+	OnCleanup  func(r *request)
 
-	id      uint64
-	l       *Loop
-	isAdded bool
-	task    worker.Task
-	watch   poller.Watch
-	alarm   timer.Alarm
+	id   int64
+	loop *Loop
 }
 
-func (r *request) Process(l *Loop) uint64 {
-	id := atomic.AddUint64(&lastRequestID, 1)
+func (r *request) Submit(loop *Loop) int64 {
+	id := loop.generateRequestID()
 
-	if !atomic.CompareAndSwapUint64(&r.id, 0, id) {
+	if !atomic.CompareAndSwapInt64(&r.id, 0, id) {
 		panic(errRequestInProcess)
 	}
 
-	r.l = l
-
-	if err := l.addTask(&r.task); err != nil {
-		r.handleError(err)
+	if err := loop.addTask(r); err != nil {
+		r.HandleError(err)
 		return 0
 	}
 
@@ -42,72 +42,49 @@ func (r *request) Process(l *Loop) uint64 {
 }
 
 func (r *request) Cancel() {
-	r.handleError(ErrRequestCanceled)
+	r.HandleError(ErrRequestCanceled)
 }
 
-func (r *request) AddReadableWatch(fd int) error {
-	return r.l.addWatch(&r.watch, fd, poller.EventReadable)
+func (r *request) Add(loop *Loop) {
+	loop.addRequest(r)
+	r.loop = loop
 }
 
-func (r *request) AddWritableWatch(fd int) error {
-	return r.l.addWatch(&r.watch, fd, poller.EventWritable)
+func (r *request) AddReadableWatch(watcherID int64) {
+	r.loop.addWatch(r, watcherID, poller.EventReadable)
+}
+
+func (r *request) AddWritableWatch(watcherID int64) {
+	r.loop.addWatch(r, watcherID, poller.EventWritable)
 }
 
 func (r *request) AddAlarm(dueTime time.Time) {
-	r.l.addAlarm(&r.alarm, dueTime)
+	r.loop.addAlarm(r, dueTime)
 }
 
-func (r *request) Loop() *Loop {
-	return r.l
-}
-
-func (r *request) add() {
-	r.l.addRequest(r.id, r)
-	r.isAdded = true
-}
-
-func (r *request) remove() {
-	l := r.l
-	l.removeRequest(r.id)
-	r.isAdded = false
-
-	if !r.watch.IsReset() {
-		l.removeWatch(&r.watch)
-	}
-
-	if !r.alarm.IsReset() {
-		l.removeAlarm(&r.alarm)
-	}
-}
-
-func (r *request) release() {
-	atomic.StoreUint64(&r.id, 0)
-	r.OnCleanup(r)
-}
-
-func (r *request) handleTask() {
+func (r *request) HandleTask() {
 	if r.OnTask(r) {
 		r.remove()
 		r.release()
 	}
 }
 
-func (r *request) handleWatch() {
+func (r *request) HandleWatch() {
 	if r.OnWatch(r) {
 		r.remove()
 		r.release()
 	}
 }
 
-func (r *request) handleAlarm() {
+func (r *request) HandleAlarm() {
 	if r.OnAlarm(r) {
 		r.remove()
 		r.release()
 	}
 }
 
-func (r *request) handleError(err error) {
-	if r.isAdded {
+func (r *request) HandleError(err error) {
+	if r.loop != nil {
 		r.remove()
 	}
 
@@ -115,4 +92,36 @@ func (r *request) handleError(err error) {
 	r.release()
 }
 
-var lastRequestID = uint64(0)
+func (r *request) Loop() *Loop {
+	return r.loop
+}
+
+func (r *request) remove() {
+	loop := r.loop
+	r.loop = nil
+	loop.removeRequest(r)
+
+	if !r.Watch.IsReset() {
+		loop.removeWatch(r)
+	}
+
+	if !r.Alarm.IsReset() {
+		loop.removeAlarm(r)
+	}
+}
+
+func (r *request) release() {
+	atomic.StoreInt64(&r.id, 0)
+	r.OnCleanup(r)
+}
+
+func orderRequestRBTreeNode(rbTreeNode1, rbTreeNode2 *intrusive.RBTreeNode) bool {
+	request1 := getRequest(rbTreeNode1)
+	request2 := getRequest(rbTreeNode2)
+	return request1.id < request2.id
+}
+
+func compareRequestRBTreeNode(rbTreeNode *intrusive.RBTreeNode, requestID interface{}) int64 {
+	request := getRequest(rbTreeNode)
+	return int64(request.id - requestID.(int64))
+}

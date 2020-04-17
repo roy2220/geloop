@@ -6,8 +6,8 @@ var (
 	// ErrClosed indicates the loop has been closed.
 	ErrClosed = errors.New("geloop: closed")
 
-	// ErrInvalidFd indicates the file descriptor is invalid.
-	ErrInvalidFd = errors.New("geloop: invalid fd")
+	// ErrInvalidWatcherID indicates the watcher id is invalid.
+	ErrInvalidWatcherID = errors.New("geloop: invalid watcher id")
 
 	// ErrFdClosed indicates the file descriptor has been closed.
 	ErrFdClosed = errors.New("geloop: fd closed")

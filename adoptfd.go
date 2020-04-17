@@ -1,6 +1,9 @@
 package geloop
 
-import "unsafe"
+import (
+	"syscall"
+	"unsafe"
+)
 
 // AdoptFdRequest represents a request about adopting a file descriptor.
 // The request should not be modified since be passed
@@ -10,14 +13,21 @@ type AdoptFdRequest struct {
 	// loop will automatically be closed when the loop is closed.
 	Fd int
 
-	// The optional function called when the request is completed.
+	// Close the file descriptor when any error occurs during
+	// the request process.
+	CloseFdOnError bool
+
+	// The function called when the request is completed.
 	//
 	// @param request
 	//     The request bound to.
 	//
+	// @param watcherID
+	//     The watcher id to read/write file.
+	//
 	// @param err
 	//     ErrClosed - when the loop has been closed;
-	Callback func(request *AdoptFdRequest, err error)
+	Callback func(request *AdoptFdRequest, err error, watcherID int64)
 
 	// The optional function called when the request is released.
 	//
@@ -28,22 +38,23 @@ type AdoptFdRequest struct {
 	r request
 }
 
-// AdoptFd requests to adopt a file descriptor.
+// AdoptFd requests to adopt a file descriptor to the loop.
 func (l *Loop) AdoptFd(request1 *AdoptFdRequest) {
-	if request1.Callback == nil {
-		request1.Callback = func(*AdoptFdRequest, error) {}
-	}
-
 	request1.r.OnTask = func(r *request) bool {
 		r1 := getAdoptFdRequest(r)
-		r1.r.Loop().adoptFd(r1.Fd)
-		r1.Callback(r1, nil)
+		watcherID := r1.r.Loop().adoptFd(r1.Fd)
+		r1.Callback(r1, nil, watcherID)
 		return true
 	}
 
 	request1.r.OnError = func(r *request, err error) {
 		r1 := getAdoptFdRequest(r)
-		r1.Callback(r1, err)
+
+		if r1.CloseFdOnError {
+			syscall.Close(r1.Fd)
+		}
+
+		r1.Callback(r1, err, 0)
 	}
 
 	request1.r.OnCleanup = func(r *request) {
@@ -54,7 +65,7 @@ func (l *Loop) AdoptFd(request1 *AdoptFdRequest) {
 		}
 	}
 
-	request1.r.Process(l)
+	request1.r.Submit(l)
 }
 
 func getAdoptFdRequest(r *request) *AdoptFdRequest {

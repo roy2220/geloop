@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"runtime"
 	"strconv"
 
 	// "net/http"
@@ -16,10 +17,12 @@ import (
 	"github.com/roy2220/geloop/byteslicepool"
 )
 
+var numLoop int
 var listenPort int
 
 func init() {
-	flag.IntVar(&listenPort, "p", 8888, "help message for flagname")
+	flag.IntVar(&numLoop, "n", runtime.NumCPU(), "number of loops")
+	flag.IntVar(&listenPort, "l", 8888, "listen port")
 	flag.Parse()
 }
 
@@ -39,51 +42,57 @@ func main() {
 }
 
 func runEchoServer(ctx context.Context) {
-	loop := new(geloop.Loop).Init(0)
-	if err := loop.Open(); err != nil {
+	lg := new(geloop.LoopGroup).Init(numLoop, 0)
+	if err := lg.Open(); err != nil {
 		panic(err)
 	}
 
-	listenAddress := "0.0.0.0:" + strconv.Itoa(listenPort)
-	fmt.Printf("listening on %s ...\n", listenAddress)
-	requestID, err := loop.AcceptSockets(&geloop.AcceptSocketsRequest{
-		NetworkName:   "tcp4",
-		ListenAddress: listenAddress,
-		AdoptFds:      true,
-		Callback: func(request *geloop.AcceptSocketsRequest, err error, fd int) {
-			if err != nil {
-				fmt.Printf("accept sockets error: %v", err)
-				loop.Stop()
-				return
-			}
-			handleConn(loop, fd)
+	s := lg.InitServer(&geloop.Server{
+		URL: "tcp://0.0.0.0:" + strconv.Itoa(listenPort),
+		OnSetup: func(s *geloop.Server) {
+			fmt.Printf("listening on %s ...\n", s.URL)
+		},
+		OnConnection: func(_ *geloop.Server, fd int) {
+			handleConn(lg, fd)
+		},
+		OnShutdown: func(s *geloop.Server) {
+			fmt.Println("exit")
 		},
 	})
-	if err != nil {
+
+	if err := s.Add(); err != nil {
 		panic(err)
 	}
 
 	go func() {
 		<-ctx.Done()
-		loop.CancelRequest(requestID)
+		lg.Stop()
 	}()
-
-	loop.Run()
-	loop.Close()
+	lg.Run()
+	lg.Close()
 }
 
-func handleConn(loop *geloop.Loop, fd int) {
-	fmt.Printf("new conn fd=%d\n", fd)
-	c := conn{
-		loop: loop,
-		fd:   fd,
-	}
-	c.read()
+func handleConn(lg *geloop.LoopGroup, fd int) {
+	lg.AdoptFd(&geloop.AdoptFdRequest{
+		Fd:             fd,
+		CloseFdOnError: true,
+		Callback: func(_ *geloop.AdoptFdRequest, err error, watcherID int64) {
+			if err != nil {
+				return
+			}
+			fmt.Printf("new conn fd=%d\n", fd)
+			c := conn{
+				lg:        lg,
+				watcherID: watcherID,
+			}
+			c.read()
+		},
+	})
 }
 
 type conn struct {
-	loop             *geloop.Loop
-	fd               int
+	lg               *geloop.LoopGroup
+	watcherID        int64
 	readFileRequest  geloop.ReadFileRequest
 	dataToSent       []byte
 	writeFileRequest geloop.WriteFileRequest
@@ -91,7 +100,7 @@ type conn struct {
 
 func (c *conn) read() {
 	c.readFileRequest = geloop.ReadFileRequest{
-		Fd: c.fd,
+		WatcherID: c.watcherID,
 		Callback: func(request *geloop.ReadFileRequest, err error, data []byte, _ []byte) (needMoreData bool) {
 			c := (*conn)(unsafe.Pointer(uintptr(unsafe.Pointer(request)) - unsafe.Offsetof(conn{}.readFileRequest)))
 			if err != nil {
@@ -103,13 +112,13 @@ func (c *conn) read() {
 			return false
 		},
 	}
-	c.loop.ReadFile(&c.readFileRequest)
+	c.lg.ReadFile(&c.readFileRequest)
 }
 
 func (c *conn) write(data []byte) {
 	c.dataToSent = data
 	c.writeFileRequest = geloop.WriteFileRequest{
-		Fd: c.fd,
+		WatcherID: c.watcherID,
 		PreCallback: func(request *geloop.WriteFileRequest, err error, buffer *[]byte) (dataSize int) {
 			c := (*conn)(unsafe.Pointer(uintptr(unsafe.Pointer(request)) - unsafe.Offsetof(conn{}.writeFileRequest)))
 			if err != nil {
@@ -130,7 +139,7 @@ func (c *conn) write(data []byte) {
 			c.read()
 		},
 	}
-	c.loop.WriteFile(&c.writeFileRequest)
+	c.lg.WriteFile(&c.writeFileRequest)
 }
 
 func (c *conn) closeOnError(err error) {
@@ -138,6 +147,6 @@ func (c *conn) closeOnError(err error) {
 		return
 	}
 
-	fmt.Printf("close conn fd=%d err=%q\n", c.fd, err)
-	c.loop.CloseFd(&geloop.CloseFdRequest{Fd: c.fd})
+	fmt.Printf("close conn watcherID=%d err=%q\n", c.watcherID, err)
+	c.lg.CloseFd(&geloop.CloseFdRequest{WatcherID: c.watcherID})
 }

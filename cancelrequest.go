@@ -6,8 +6,8 @@ import (
 )
 
 // CancelRequest requests to cancel a request with the given id.
-func (l *Loop) CancelRequest(requestID uint64) {
-	if requestID == 0 {
+func (l *Loop) CancelRequest(requestID int64) {
+	if requestID < 1 {
 		return
 	}
 
@@ -31,12 +31,12 @@ func (l *Loop) CancelRequest(requestID uint64) {
 		freeCancelRequestRequest(r1)
 	}
 
-	request1.R.Process(l)
+	request1.R.Submit(l)
 }
 
 type cancelRequestRequest struct {
 	R                   request
-	IDOfRequestToCancel uint64
+	IDOfRequestToCancel int64
 }
 
 var cancelRequestRequestPool = sync.Pool{New: func() interface{} { return new(cancelRequestRequest) }}

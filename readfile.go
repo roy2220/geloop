@@ -10,8 +10,8 @@ import (
 // The request should not be modified since be passed
 // as an argument to *Loop.ReadFile call until be released.
 type ReadFileRequest struct {
-	// The descriptor of the file to read.
-	Fd int
+	// The watcher id by adopting the descriptor of the file.
+	WatcherID int64
 
 	// The deadline of the request.
 	Deadline time.Time
@@ -23,8 +23,7 @@ type ReadFileRequest struct {
 	//
 	// @param err
 	//     ErrClosed - when the loop has been closed;
-	//     ErrInvalidFd - when the fd hasn't yet been adopted
-	//                    or has already been closed;
+	//     ErrInvalidWatcherID - when the watcher id is invalid.
 	//     ErrFdClosed - when the fd has been closed during
 	//                   the request process;
 	//     ErrRequestCanceled - when the request has been
@@ -58,7 +57,7 @@ type ReadFileRequest struct {
 
 // ReadFile requests to read the given file in the loop.
 // It returns the request id for cancellation.
-func (l *Loop) ReadFile(request1 *ReadFileRequest) uint64 {
+func (l *Loop) ReadFile(request1 *ReadFileRequest) int64 {
 	request1.r.OnTask = func(r *request) bool {
 		r1 := getReadFileRequest(r)
 
@@ -97,58 +96,38 @@ func (l *Loop) ReadFile(request1 *ReadFileRequest) uint64 {
 		}
 	}
 
-	return request1.r.Process(l)
-}
-
-func getReadFileRequest(r *request) *ReadFileRequest {
-	return (*ReadFileRequest)(unsafe.Pointer(uintptr(unsafe.Pointer(r)) - unsafe.Offsetof(ReadFileRequest{}.r)))
+	return request1.r.Submit(l)
 }
 
 func (r *ReadFileRequest) process() bool {
-	l := r.r.Loop()
-	reservedBuffer := l.readBuffer[:l.reservedReadBufferSize]
-	buffer := l.readBuffer[l.reservedReadBufferSize:]
+	loop := r.r.Loop()
+	fd, err := loop.getFd(r.WatcherID)
+
+	if err != nil {
+		r.Callback(r, err, nil, nil)
+		return true
+	}
+
+	reservedBuffer := loop.readBuffer[:loop.reservedReadBufferSize]
+	buffer := loop.readBuffer[loop.reservedReadBufferSize:]
 	i := 0
 
 	for {
-		n, err := syscall.Read(r.Fd, buffer[i:])
+		n, err := syscall.Read(fd, buffer[i:])
 
 		if err != nil || n == 0 {
 			switch err {
+			case syscall.EAGAIN:
+				n = 0
 			case syscall.EINTR:
 				continue
-			case syscall.EAGAIN:
-				var needMoreData bool
-
-				if i == 0 {
-					needMoreData = true
-				} else {
-					needMoreData = r.Callback(r, nil, buffer[:i], reservedBuffer)
-				}
-
-				if needMoreData {
-					if err := r.r.AddReadableWatch(r.Fd); err != nil {
-						r.Callback(r, err, nil, nil)
-						return true
-					}
-
-					return false
-				}
-
-				return true
 			default:
 				if err == nil {
 					err = ErrNoMoreData
 				}
 
-				if i == 0 {
+				if i == 0 || r.Callback(r, nil, buffer[:i], reservedBuffer) {
 					r.Callback(r, err, nil, nil)
-				} else {
-					needMoreData := r.Callback(r, nil, buffer[:i], reservedBuffer)
-
-					if needMoreData {
-						r.Callback(r, err, nil, nil)
-					}
 				}
 
 				return true
@@ -157,12 +136,23 @@ func (r *ReadFileRequest) process() bool {
 
 		i += n
 
-		if i == len(buffer) {
-			l.readBuffer = make([]byte, l.reservedReadBufferSize+2*len(buffer))
-			reservedBuffer = l.readBuffer[:l.reservedReadBufferSize]
-			temp := l.readBuffer[l.reservedReadBufferSize:]
-			copy(temp, buffer)
-			buffer = temp
+		if i < len(buffer) {
+			if i == 0 || r.Callback(r, nil, buffer[:i], reservedBuffer) {
+				r.r.AddReadableWatch(r.WatcherID)
+				return false
+			}
+
+			return true
 		}
+
+		loop.readBuffer = make([]byte, loop.reservedReadBufferSize+2*len(buffer))
+		reservedBuffer = loop.readBuffer[:loop.reservedReadBufferSize]
+		temp := loop.readBuffer[loop.reservedReadBufferSize:]
+		copy(temp, buffer)
+		buffer = temp
 	}
+}
+
+func getReadFileRequest(r *request) *ReadFileRequest {
+	return (*ReadFileRequest)(unsafe.Pointer(uintptr(unsafe.Pointer(r)) - unsafe.Offsetof(ReadFileRequest{}.r)))
 }

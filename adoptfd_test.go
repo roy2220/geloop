@@ -17,7 +17,7 @@ func TestLoopAdoptFd(t *testing.T) {
 		var err error
 		l.AdoptFd(&geloop.AdoptFdRequest{
 			Fd: 100,
-			Callback: func(_ *geloop.AdoptFdRequest, err2 error) {
+			Callback: func(_ *geloop.AdoptFdRequest, err2 error, watcherID int64) {
 				err = err2
 				l.Stop()
 			},
@@ -29,7 +29,7 @@ func TestLoopAdoptFd(t *testing.T) {
 		var err error
 		l.AdoptFd(&geloop.AdoptFdRequest{
 			Fd: 100,
-			Callback: func(_ *geloop.AdoptFdRequest, err2 error) {
+			Callback: func(_ *geloop.AdoptFdRequest, err2 error, watcherID int64) {
 				err = err2
 			},
 		})
@@ -41,12 +41,14 @@ func TestLoopAdoptFd(t *testing.T) {
 	}
 	{
 		err := make(chan error, 1)
-		l.AdoptFd(&geloop.AdoptFdRequest{
-			Fd: 100,
-			Callback: func(_ *geloop.AdoptFdRequest, err2 error) {
+		r := geloop.AdoptFdRequest{
+			Fd:             100,
+			CloseFdOnError: true,
+			Callback: func(_ *geloop.AdoptFdRequest, err2 error, watcherID int64) {
 				err <- err2
 			},
-		})
+		}
+		l.AdoptFd(&r)
 		assert.EqualError(t, <-err, geloop.ErrClosed.Error())
 	}
 }

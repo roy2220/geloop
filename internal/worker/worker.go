@@ -25,7 +25,7 @@ func (w *Worker) Init(poller *poller.Poller) *Worker {
 	w.poller = poller
 	w.fd = -1
 	w.taskList.Init()
-	w.averageProcessedTaskCount.Init(1000)
+	w.averageProcessedTaskCount.Init(1000, 1)
 	return w
 }
 
@@ -38,7 +38,7 @@ func (w *Worker) Open() error {
 	}
 
 	fd := int(r1)
-	w.poller.AdoptFd(fd)
+	w.poller.AdoptFd(fd, watcherID)
 	w.fd = fd
 	return nil
 }
@@ -59,12 +59,12 @@ func (w *Worker) Close(callback func(*Task)) error {
 	}
 
 	w.taskList = intrusive.List{}
-	return w.poller.CloseFd(w.fd, func(*poller.Watch) {})
+	return w.poller.CloseFd(watcherID, func(*poller.Watch) {})
 }
 
 // AddWatch ...
-func (w *Worker) AddWatch(watch *poller.Watch) error {
-	return w.poller.AddWatch(watch, w.fd, poller.EventReadable)
+func (w *Worker) AddWatch(watch *poller.Watch) {
+	w.poller.AddWatch(watch, watcherID, poller.EventReadable)
 }
 
 // AddTask ...
@@ -91,8 +91,8 @@ func (w *Worker) AddTask(task *Task) error {
 // ProcessTasks ...
 func (w *Worker) ProcessTasks(callback func(*Task)) error {
 	taskList := new(intrusive.List).Init()
-	averageProcessedTaskCount := w.averageProcessedTaskCount.Calculate()
 	processedTaskCount := int64(0)
+	maxProcessedTaskCount := w.averageProcessedTaskCount.Calculate()
 
 	for {
 		ok, err := w.removeTasks(taskList)
@@ -110,7 +110,7 @@ func (w *Worker) ProcessTasks(callback func(*Task)) error {
 			processedTaskCount++
 		}
 
-		if processedTaskCount >= averageProcessedTaskCount {
+		if processedTaskCount >= maxProcessedTaskCount {
 			w.averageProcessedTaskCount.UpdateSample(processedTaskCount)
 			return nil
 		}
@@ -142,3 +142,5 @@ type Task struct {
 
 // ErrClosed ...
 var ErrClosed = errors.New("worker: closed")
+
+const watcherID = -1001

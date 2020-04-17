@@ -7,7 +7,7 @@ type mean struct {
 	sum             int64
 }
 
-func (m *mean) Init(simpleSize int) *mean {
+func (m *mean) Init(simpleSize int, initialValue int64) *mean {
 	simpleSize2 := 1
 
 	for simpleSize2 < simpleSize {
@@ -16,6 +16,12 @@ func (m *mean) Init(simpleSize int) *mean {
 	}
 
 	m.sample = make([]int64, simpleSize2)
+
+	for i := range m.sample {
+		m.sample[i] = initialValue
+	}
+
+	m.sum = initialValue << m.sampleSizeShift
 	return m
 }
 

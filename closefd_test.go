@@ -13,11 +13,19 @@ func TestLoopCloseFd(t *testing.T) {
 	if !assert.NoError(t, err) {
 		t.FailNow()
 	}
-	l.AdoptFd(&geloop.AdoptFdRequest{Fd: 100})
+	var watcherID int64
+	l.AdoptFd(&geloop.AdoptFdRequest{
+		Fd: 100,
+		Callback: func(_ *geloop.AdoptFdRequest, err error, watcherID2 int64) {
+			watcherID = watcherID2
+			l.Stop()
+		},
+	})
+	l.Run()
 	{
 		var err error
 		l.CloseFd(&geloop.CloseFdRequest{
-			Fd: 100,
+			WatcherID: watcherID,
 			Callback: func(_ *geloop.CloseFdRequest, err2 error) {
 				err = err2
 				l.Stop()
@@ -29,7 +37,7 @@ func TestLoopCloseFd(t *testing.T) {
 	{
 		var err error
 		l.CloseFd(&geloop.CloseFdRequest{
-			Fd: 100,
+			WatcherID: watcherID,
 			Callback: func(_ *geloop.CloseFdRequest, err2 error) {
 				err = err2
 			},
@@ -43,7 +51,7 @@ func TestLoopCloseFd(t *testing.T) {
 	{
 		err := make(chan error, 1)
 		l.CloseFd(&geloop.CloseFdRequest{
-			Fd: 100,
+			WatcherID: watcherID,
 			Callback: func(_ *geloop.CloseFdRequest, err2 error) {
 				err <- err2
 			},

@@ -3,8 +3,11 @@ package geloop
 
 import (
 	"runtime"
+	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"github.com/roy2220/intrusive"
 
 	"github.com/roy2220/geloop/internal/poller"
 	"github.com/roy2220/geloop/internal/timer"
@@ -19,7 +22,10 @@ type Loop struct {
 	worker                 worker.Worker
 	workerWatch            *poller.Watch
 	isBroken               bool
-	requests               map[uint64]*request
+	lastRequestIDX2        uint64
+	lastWatcherIDX2        uint64
+	groupSizeX2            uint64
+	requestRBTree          intrusive.RBTree
 	readBuffer             []byte
 	writeBuffer            []byte
 }
@@ -30,8 +36,9 @@ func (l *Loop) Init(reservedReadBufferSize int) *Loop {
 	l.poller.Init()
 	l.timer.Init()
 	l.worker.Init(&l.poller)
-	l.workerWatch = &(&request{OnWatch: func(*request) bool { return false }}).watch
-	l.requests = make(map[uint64]*request)
+	l.workerWatch = &(&request{OnWatch: func(*request) bool { return false }}).Watch
+	l.groupSizeX2 = 2
+	l.requestRBTree.Init(orderRequestRBTreeNode, compareRequestRBTreeNode)
 	l.readBuffer = make([]byte, reservedReadBufferSize+initialReadBufferSize)
 	l.writeBuffer = make([]byte, initialWriteBufferSize)
 	return l
@@ -52,25 +59,25 @@ func (l *Loop) Open() error {
 }
 
 // Close closes the loop. All file descriptors adopted in the
-// loop will automatically be closed at the same time.
+// loop will automatically be closed at once.
 func (l *Loop) Close() error {
 	if err := l.worker.Close(func(task *worker.Task) {
 		request := getRequestByTask(task)
-		request.handleError(ErrClosed)
+		request.HandleError(ErrClosed)
 	}); err != nil {
 		return err
 	}
 
 	if err := l.poller.Close(func(watch *poller.Watch) {
 		request := getRequestByWatch(watch)
-		request.handleError(ErrClosed)
+		request.HandleError(ErrClosed)
 	}); err != nil {
 		return err
 	}
 
 	l.timer.Close(func(alarm *timer.Alarm) {
 		request := getRequestByAlarm(alarm)
-		request.handleError(ErrClosed)
+		request.HandleError(ErrClosed)
 	})
 
 	return nil
@@ -97,22 +104,26 @@ func (l *Loop) Stop() {
 
 		OnError:   func(*request, error) {},
 		OnCleanup: func(*request) {},
-	}).Process(l)
+	}).Submit(l)
+}
+
+func (l *Loop) group(groupSize int, index int) {
+	l.lastRequestIDX2 = uint64(index << 1)
+	l.lastWatcherIDX2 = uint64(index << 1)
+	l.groupSizeX2 = uint64(groupSize << 1)
 }
 
 func (l *Loop) iterate() {
 	deadline, _ := l.timer.GetMinDueTime()
 
 	if l.workerWatch.IsReset() {
-		if err := l.worker.AddWatch(l.workerWatch); err != nil {
-			panic(err)
-		}
+		l.worker.AddWatch(l.workerWatch)
 	}
 
 	// println("--- poller begin ---")
 	if err := l.poller.ProcessWatches(deadline, func(watch *poller.Watch) {
 		request := getRequestByWatch(watch)
-		request.handleWatch()
+		request.HandleWatch()
 	}); err != nil {
 		panic(err)
 	}
@@ -121,15 +132,15 @@ func (l *Loop) iterate() {
 	// println("--- timer begin ---")
 	l.timer.ProcessAlarms(func(alarm *timer.Alarm) {
 		request := getRequestByAlarm(alarm)
-		request.handleAlarm()
+		request.HandleAlarm()
 	})
 	// println("--- timer end ---")
 
 	// println("--- worker begin ---")
 	if err := l.worker.ProcessTasks(func(task *worker.Task) {
 		request := getRequestByTask(task)
-		request.add()
-		request.handleTask()
+		request.Add(l)
+		request.HandleTask()
 	}); err != nil {
 		panic(err)
 	}
@@ -137,8 +148,51 @@ func (l *Loop) iterate() {
 
 }
 
-func (l *Loop) addTask(task *worker.Task) error {
-	err := l.worker.AddTask(task)
+func (l *Loop) generateRequestID() int64 {
+	requestIDX2 := atomic.AddUint64(&l.lastRequestIDX2, l.groupSizeX2)
+
+	if requestIDX2 < l.groupSizeX2 {
+		// overflow
+		requestIDX2 = atomic.AddUint64(&l.lastRequestIDX2, l.groupSizeX2)
+	}
+
+	return int64(requestIDX2 >> 1)
+}
+
+func (l *Loop) generateWatcherID() int64 {
+	l.lastWatcherIDX2 += l.groupSizeX2
+	watcherIDX2 := l.lastWatcherIDX2
+
+	if watcherIDX2 < l.groupSizeX2 {
+		// overflow
+		l.lastWatcherIDX2 += l.groupSizeX2
+		watcherIDX2 = l.lastWatcherIDX2
+	}
+
+	return int64(watcherIDX2 >> 1)
+}
+
+func (l *Loop) addRequest(request *request) {
+	l.requestRBTree.InsertNode(&request.RBTreeNode)
+}
+
+func (l *Loop) removeRequest(request *request) {
+	l.requestRBTree.RemoveNode(&request.RBTreeNode)
+}
+
+func (l *Loop) getRequest(requestID int64) (*request, bool) {
+	rbTreeNode, ok := l.requestRBTree.FindNode(requestID)
+
+	if !ok {
+		return nil, false
+	}
+
+	request := getRequest(rbTreeNode)
+	return request, true
+}
+
+func (l *Loop) addTask(request *request) error {
+	err := l.worker.AddTask(&request.Task)
 
 	if err != nil {
 		switch err {
@@ -152,64 +206,55 @@ func (l *Loop) addTask(task *worker.Task) error {
 	return err
 }
 
-func (l *Loop) adoptFd(fd int) {
-	l.poller.AdoptFd(fd)
+func (l *Loop) adoptFd(fd int) int64 {
+	watcherID := l.generateWatcherID()
+	l.poller.AdoptFd(fd, watcherID)
+	return watcherID
 }
 
-func (l *Loop) closeFd(fd int) error {
-	err := l.poller.CloseFd(fd, func(watch *poller.Watch) {
+func (l *Loop) closeFd(watcherID int64) error {
+	err := l.poller.CloseFd(watcherID, func(watch *poller.Watch) {
 		r := getRequestByWatch(watch)
-		r.handleError(ErrFdClosed)
+		r.HandleError(ErrFdClosed)
 	})
 
 	if err != nil {
 		switch err {
-		case poller.ErrInvalidFd:
-			err = ErrInvalidFd
+		case poller.ErrInvalidWatcherID:
+			err = ErrInvalidWatcherID
 		}
 	}
 
 	return err
 }
 
-func (l *Loop) addWatch(watch *poller.Watch, fd int, eventType poller.EventType) error {
-	err := l.poller.AddWatch(watch, fd, eventType)
+func (l *Loop) getFd(watcherID int64) (int, error) {
+	fd, err := l.poller.GetFd(watcherID)
 
 	if err != nil {
 		switch err {
-		case poller.ErrInvalidFd:
-			err = ErrInvalidFd
-		default:
-			panic(err)
+		case poller.ErrInvalidWatcherID:
+			err = ErrInvalidWatcherID
 		}
 	}
 
-	return err
+	return fd, err
 }
 
-func (l *Loop) removeWatch(watch *poller.Watch) {
-	l.poller.RemoveWatch(watch)
+func (l *Loop) addWatch(request *request, watcherID int64, eventType poller.EventType) {
+	l.poller.AddWatch(&request.Watch, watcherID, eventType)
 }
 
-func (l *Loop) addAlarm(alarm *timer.Alarm, dueTime time.Time) {
-	l.timer.AddAlarm(alarm, dueTime)
+func (l *Loop) removeWatch(request *request) {
+	l.poller.RemoveWatch(&request.Watch)
 }
 
-func (l *Loop) removeAlarm(alarm *timer.Alarm) {
-	l.timer.RemoveAlarm(alarm)
+func (l *Loop) addAlarm(request *request, dueTime time.Time) {
+	l.timer.AddAlarm(&request.Alarm, dueTime)
 }
 
-func (l *Loop) addRequest(requestID uint64, request *request) {
-	l.requests[requestID] = request
-}
-
-func (l *Loop) removeRequest(requestID uint64) {
-	delete(l.requests, requestID)
-}
-
-func (l *Loop) getRequest(requestID uint64) (*request, bool) {
-	request, ok := l.requests[requestID]
-	return request, ok
+func (l *Loop) removeAlarm(request *request) {
+	l.timer.RemoveAlarm(&request.Alarm)
 }
 
 const (
@@ -217,14 +262,18 @@ const (
 	initialWriteBufferSize = 1024
 )
 
+func getRequest(rbTreeNode *intrusive.RBTreeNode) *request {
+	return (*request)(rbTreeNode.GetContainer(unsafe.Offsetof(request{}.RBTreeNode)))
+}
+
 func getRequestByTask(task *worker.Task) *request {
-	return (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(task)) - unsafe.Offsetof(request{}.task)))
+	return (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(task)) - unsafe.Offsetof(request{}.Task)))
 }
 
 func getRequestByWatch(watch *poller.Watch) *request {
-	return (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(watch)) - unsafe.Offsetof(request{}.watch)))
+	return (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(watch)) - unsafe.Offsetof(request{}.Watch)))
 }
 
 func getRequestByAlarm(alarm *timer.Alarm) *request {
-	return (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(alarm)) - unsafe.Offsetof(request{}.alarm)))
+	return (*request)(unsafe.Pointer(uintptr(unsafe.Pointer(alarm)) - unsafe.Offsetof(request{}.Alarm)))
 }

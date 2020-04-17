@@ -6,9 +6,10 @@ import "unsafe"
 // The request should not be modified since be passed
 // as an argument to *Loop.CloseFd call until be released.
 type CloseFdRequest struct {
-	// The file descriptor to close. All file descriptors adopted in a
-	// loop will automatically be closed when the loop is closed.
-	Fd int
+	// The watcher id by adopting the file descriptor. All file
+	// descriptors adopted in a loop will automatically be closed
+	// when the loop is closed.
+	WatcherID int64
 
 	// The optional function called when the request is completed.
 	//
@@ -17,8 +18,7 @@ type CloseFdRequest struct {
 	//
 	// @param err
 	//     ErrClosed - when the loop has been closed;
-	//     ErrInvalidFd - when the fd hasn't yet been adopted
-	//                    or has already been closed;
+	//     ErrInvalidWatcherID - when the watcher id is invalid.
 	//     the other errors the syscall.Close() returned.
 	Callback func(request *CloseFdRequest, err error)
 
@@ -31,7 +31,7 @@ type CloseFdRequest struct {
 	r request
 }
 
-// CloseFd requests to close a file descriptor.
+// CloseFd requests to close a file descriptor in the loop.
 func (l *Loop) CloseFd(request1 *CloseFdRequest) {
 	if request1.Callback == nil {
 		request1.Callback = func(*CloseFdRequest, error) {}
@@ -39,7 +39,7 @@ func (l *Loop) CloseFd(request1 *CloseFdRequest) {
 
 	request1.r.OnTask = func(r *request) bool {
 		r1 := getCloseFdRequest(r)
-		err := r1.r.Loop().closeFd(r1.Fd)
+		err := r1.r.Loop().closeFd(r1.WatcherID)
 		r1.Callback(r1, err)
 		return true
 	}
@@ -57,7 +57,7 @@ func (l *Loop) CloseFd(request1 *CloseFdRequest) {
 		}
 	}
 
-	request1.r.Process(l)
+	request1.r.Submit(l)
 }
 
 func getCloseFdRequest(r *request) *CloseFdRequest {

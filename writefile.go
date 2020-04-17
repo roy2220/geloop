@@ -12,8 +12,8 @@ import (
 // The request should not be modified since be passed
 // as an argument to *Loop.WriteFile call until be released.
 type WriteFileRequest struct {
-	// The descriptor of the file to write.
-	Fd int
+	// The watcher id by adopting the descriptor of the file.
+	WatcherID int64
 
 	// The deadline of the request.
 	Deadline time.Time
@@ -44,8 +44,7 @@ type WriteFileRequest struct {
 	//
 	// @param err
 	//     ErrClosed - when the loop has been closed;
-	//     ErrInvalidFd - when the fd hasn't yet been adopted
-	//                    or has already been closed;
+	//     ErrInvalidWatcherID - when the watcher id is invalid.
 	//     ErrFdClosed - when the fd has been closed during
 	//                   the request process;
 	//     ErrRequestCanceled - when the request has been
@@ -64,19 +63,20 @@ type WriteFileRequest struct {
 	//     The request bound to.
 	Cleanup func(request *WriteFileRequest)
 
-	r                 request
 	numberOfBytesSent int
 	unsentData        []byte
 	bufferToReuse     []byte
+
+	r request
 }
 
 // WriteFile requests to write the given file in the loop.
 // It returns the request id for cancellation.
-func (l *Loop) WriteFile(request1 *WriteFileRequest) uint64 {
+func (l *Loop) WriteFile(request1 *WriteFileRequest) int64 {
 	request1.r.OnTask = func(r *request) bool {
 		r1 := getWriteFileRequest(r)
 
-		if r1.process() {
+		if r1.process1() {
 			return true
 		}
 
@@ -89,7 +89,7 @@ func (l *Loop) WriteFile(request1 *WriteFileRequest) uint64 {
 
 	request1.r.OnWatch = func(r *request) bool {
 		r1 := getWriteFileRequest(r)
-		return r1.process()
+		return r1.process2()
 	}
 
 	request1.r.OnAlarm = func(r *request) bool {
@@ -119,62 +119,67 @@ func (l *Loop) WriteFile(request1 *WriteFileRequest) uint64 {
 		}
 	}
 
-	return request1.r.Process(l)
+	return request1.r.Submit(l)
 }
 
-func (r *WriteFileRequest) process() bool {
-	l := r.r.Loop()
+func (r *WriteFileRequest) process1() bool {
+	loop := r.r.Loop()
+	dataSize := r.PreCallback(r, nil, &loop.writeBuffer)
+	data := loop.writeBuffer[:dataSize]
+	fd, err := loop.getFd(r.WatcherID)
 
-	if r.unsentData == nil {
-		dataSize := r.PreCallback(r, nil, &l.writeBuffer)
-
-		for {
-			unsentData := l.writeBuffer[r.numberOfBytesSent:dataSize]
-			n, err := syscall.Write(r.Fd, unsentData)
-
-			if err != nil {
-				switch err {
-				case syscall.EINTR:
-					continue
-				case syscall.EAGAIN:
-					r.unsentData = append(byteslicepool.Get(), unsentData...)
-					r.bufferToReuse = r.unsentData
-
-					if err := r.r.AddWritableWatch(r.Fd); err != nil {
-						r.PostCallback(r, err, r.numberOfBytesSent)
-						return true
-					}
-
-					return false
-				default:
-					r.PostCallback(r, err, r.numberOfBytesSent)
-					return true
-				}
-			}
-
-			r.numberOfBytesSent += n
-
-			if r.numberOfBytesSent == dataSize {
-				r.PostCallback(r, nil, r.numberOfBytesSent)
-				return true
-			}
-		}
+	if err != nil {
+		r.PostCallback(r, err, 0)
+		return true
 	}
 
 	for {
-		n, err := syscall.Write(r.Fd, r.unsentData)
+		n, err := syscall.Write(fd, data)
 
 		if err != nil {
 			switch err {
+			case syscall.EAGAIN:
+				n = 0
 			case syscall.EINTR:
 				continue
-			case syscall.EAGAIN:
-				if err := r.r.AddWritableWatch(r.Fd); err != nil {
-					r.PostCallback(r, err, r.numberOfBytesSent)
-					return true
-				}
+			default:
+				r.PostCallback(r, err, 0)
+				return true
+			}
+		}
 
-				return false
+		r.numberOfBytesSent += n
+
+		if r.numberOfBytesSent == dataSize {
+			r.PostCallback(r, nil, r.numberOfBytesSent)
+			return true
+		}
+
+		r.unsentData = append(byteslicepool.Get(), data[r.numberOfBytesSent:]...)
+		r.bufferToReuse = r.unsentData
+		r.r.AddWritableWatch(r.WatcherID)
+		return false
+	}
+
+}
+
+func (r *WriteFileRequest) process2() bool {
+	fd, err := r.r.Loop().getFd(r.WatcherID)
+
+	if err != nil {
+		r.PostCallback(r, err, r.numberOfBytesSent)
+		return true
+	}
+
+	for {
+		n, err := syscall.Write(fd, r.unsentData)
+
+		if err != nil {
+			switch err {
+			case syscall.EAGAIN:
+				n = 0
+			case syscall.EINTR:
+				continue
 			default:
 				r.PostCallback(r, err, r.numberOfBytesSent)
 				return true
@@ -189,6 +194,9 @@ func (r *WriteFileRequest) process() bool {
 			r.PostCallback(r, nil, r.numberOfBytesSent)
 			return true
 		}
+
+		r.r.AddWritableWatch(r.WatcherID)
+		return false
 	}
 }
 
