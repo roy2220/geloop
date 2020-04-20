@@ -119,13 +119,14 @@ func (l *Loop) WriteFile(request1 *WriteFileRequest) int64 {
 		}
 	}
 
-	return request1.r.Submit(l)
+	return l.submitRequest(&request1.r)
 }
 
 func (r *WriteFileRequest) process1() bool {
 	loop := r.r.Loop()
-	dataSize := r.PreCallback(r, nil, &loop.writeBuffer)
-	data := loop.writeBuffer[:dataSize]
+	sharedContext := &loop.writeFileSharedContext
+	dataSize := r.PreCallback(r, nil, &sharedContext.Buffer)
+	data := sharedContext.Buffer[:dataSize]
 	fd, err := loop.getFd(r.WatcherID)
 
 	if err != nil {
@@ -198,6 +199,16 @@ func (r *WriteFileRequest) process2() bool {
 		r.r.AddWritableWatch(r.WatcherID)
 		return false
 	}
+}
+
+const initialWriteBufferSize = 1024
+
+type writeFileSharedContext struct {
+	Buffer []byte
+}
+
+func (wfsc *writeFileSharedContext) Init() {
+	wfsc.Buffer = make([]byte, initialWriteBufferSize)
 }
 
 func getWriteFileRequest(r *request) *WriteFileRequest {

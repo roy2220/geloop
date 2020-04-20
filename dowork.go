@@ -47,7 +47,7 @@ func (l *Loop) DoWork(request1 *DoWorkRequest) {
 		}
 	}
 
-	request1.r.Submit(l)
+	l.submitRequest(&request1.r)
 }
 
 func getDoWorkRequest(r *request) *DoWorkRequest {

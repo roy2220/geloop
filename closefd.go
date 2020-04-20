@@ -57,7 +57,7 @@ func (l *Loop) CloseFd(request1 *CloseFdRequest) {
 		}
 	}
 
-	request1.r.Submit(l)
+	l.submitRequest(&request1.r)
 }
 
 func getCloseFdRequest(r *request) *CloseFdRequest {

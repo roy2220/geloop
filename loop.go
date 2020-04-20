@@ -16,31 +16,28 @@ import (
 
 // Loop represents an event loop.
 type Loop struct {
-	reservedReadBufferSize int
+	idGenerator
+
 	poller                 poller.Poller
 	timer                  timer.Timer
 	worker                 worker.Worker
 	workerWatch            *poller.Watch
 	isBroken               bool
-	lastRequestIDX2        uint64
-	lastWatcherIDX2        uint64
-	groupSizeX2            uint64
 	requestRBTree          intrusive.RBTree
-	readBuffer             []byte
-	writeBuffer            []byte
+	readFileSharedContext  readFileSharedContext
+	writeFileSharedContext writeFileSharedContext
 }
 
 // Init initializes the loop and then returns the loop.
 func (l *Loop) Init(reservedReadBufferSize int) *Loop {
-	l.reservedReadBufferSize = reservedReadBufferSize
+	l.idGenerator.group(1, 0)
 	l.poller.Init()
 	l.timer.Init()
 	l.worker.Init(&l.poller)
 	l.workerWatch = &(&request{OnWatch: func(*request) bool { return false }}).Watch
-	l.groupSizeX2 = 2
 	l.requestRBTree.Init(orderRequestRBTreeNode, compareRequestRBTreeNode)
-	l.readBuffer = make([]byte, reservedReadBufferSize+initialReadBufferSize)
-	l.writeBuffer = make([]byte, initialWriteBufferSize)
+	l.readFileSharedContext.Init(reservedReadBufferSize)
+	l.writeFileSharedContext.Init()
 	return l
 }
 
@@ -96,7 +93,7 @@ func (l *Loop) Run() {
 
 // Stop requests to stop the loop.
 func (l *Loop) Stop() {
-	(&request{
+	l.submitRequest(&request{
 		OnTask: func(*request) bool {
 			l.isBroken = true
 			return true
@@ -104,13 +101,7 @@ func (l *Loop) Stop() {
 
 		OnError:   func(*request, error) {},
 		OnCleanup: func(*request) {},
-	}).Submit(l)
-}
-
-func (l *Loop) group(groupSize int, index int) {
-	l.lastRequestIDX2 = uint64(index << 1)
-	l.lastWatcherIDX2 = uint64(index << 1)
-	l.groupSizeX2 = uint64(groupSize << 1)
+	})
 }
 
 func (l *Loop) iterate() {
@@ -148,28 +139,31 @@ func (l *Loop) iterate() {
 
 }
 
-func (l *Loop) generateRequestID() int64 {
-	requestIDX2 := atomic.AddUint64(&l.lastRequestIDX2, l.groupSizeX2)
+func (l *Loop) submitRequest(request *request) int64 {
+	requestID := l.generateRequestID()
+	request.Init(requestID)
 
-	if requestIDX2 < l.groupSizeX2 {
-		// overflow
-		requestIDX2 = atomic.AddUint64(&l.lastRequestIDX2, l.groupSizeX2)
+	if err := l.addTask(request); err != nil {
+		request.HandleError(err)
+		return 0
 	}
 
-	return int64(requestIDX2 >> 1)
+	return requestID
 }
 
-func (l *Loop) generateWatcherID() int64 {
-	l.lastWatcherIDX2 += l.groupSizeX2
-	watcherIDX2 := l.lastWatcherIDX2
+func (l *Loop) addTask(request *request) error {
+	err := l.worker.AddTask(&request.Task)
 
-	if watcherIDX2 < l.groupSizeX2 {
-		// overflow
-		l.lastWatcherIDX2 += l.groupSizeX2
-		watcherIDX2 = l.lastWatcherIDX2
+	if err != nil {
+		switch err {
+		case worker.ErrClosed:
+			err = ErrClosed
+		default:
+			panic(err)
+		}
 	}
 
-	return int64(watcherIDX2 >> 1)
+	return err
 }
 
 func (l *Loop) addRequest(request *request) {
@@ -189,21 +183,6 @@ func (l *Loop) getRequest(requestID int64) (*request, bool) {
 
 	request := getRequest(rbTreeNode)
 	return request, true
-}
-
-func (l *Loop) addTask(request *request) error {
-	err := l.worker.AddTask(&request.Task)
-
-	if err != nil {
-		switch err {
-		case worker.ErrClosed:
-			err = ErrClosed
-		default:
-			panic(err)
-		}
-	}
-
-	return err
 }
 
 func (l *Loop) adoptFd(fd int) int64 {
@@ -257,10 +236,41 @@ func (l *Loop) removeAlarm(request *request) {
 	l.timer.RemoveAlarm(&request.Alarm)
 }
 
-const (
-	initialReadBufferSize  = 1024
-	initialWriteBufferSize = 1024
-)
+type idGenerator struct {
+	lastRequestIDX2 uint64
+	lastWatcherIDX2 uint64
+	groupSizeX2     uint64
+}
+
+func (idg *idGenerator) group(groupSize int, index int) {
+	idg.lastRequestIDX2 = uint64(index << 1)
+	idg.lastWatcherIDX2 = uint64(index << 1)
+	idg.groupSizeX2 = uint64(groupSize << 1)
+}
+
+func (idg *idGenerator) generateRequestID() int64 {
+	requestIDX2 := atomic.AddUint64(&idg.lastRequestIDX2, idg.groupSizeX2)
+
+	if requestIDX2 < idg.groupSizeX2 {
+		// overflow
+		requestIDX2 = atomic.AddUint64(&idg.lastRequestIDX2, idg.groupSizeX2)
+	}
+
+	return int64(requestIDX2 >> 1)
+}
+
+func (idg *idGenerator) generateWatcherID() int64 {
+	idg.lastWatcherIDX2 += idg.groupSizeX2
+	watcherIDX2 := idg.lastWatcherIDX2
+
+	if watcherIDX2 < idg.groupSizeX2 {
+		// overflow
+		idg.lastWatcherIDX2 += idg.groupSizeX2
+		watcherIDX2 = idg.lastWatcherIDX2
+	}
+
+	return int64(watcherIDX2 >> 1)
+}
 
 func getRequest(rbTreeNode *intrusive.RBTreeNode) *request {
 	return (*request)(rbTreeNode.GetContainer(unsafe.Offsetof(request{}.RBTreeNode)))

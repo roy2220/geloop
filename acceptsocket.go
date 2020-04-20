@@ -88,7 +88,7 @@ func (l *Loop) AcceptSocket(request1 *AcceptSocketRequest) int64 {
 		}
 	}
 
-	return request1.r.Submit(l)
+	return l.submitRequest(&request1.r)
 }
 
 func (r *AcceptSocketRequest) process() bool {

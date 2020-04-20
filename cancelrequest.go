@@ -31,7 +31,7 @@ func (l *Loop) CancelRequest(requestID int64) {
 		freeCancelRequestRequest(r1)
 	}
 
-	request1.R.Submit(l)
+	l.submitRequest(&request1.R)
 }
 
 type cancelRequestRequest struct {

@@ -26,19 +26,10 @@ type request struct {
 	loop *Loop
 }
 
-func (r *request) Submit(loop *Loop) int64 {
-	id := loop.generateRequestID()
-
+func (r *request) Init(id int64) {
 	if !atomic.CompareAndSwapInt64(&r.id, 0, id) {
 		panic(errRequestInProcess)
 	}
-
-	if err := loop.addTask(r); err != nil {
-		r.HandleError(err)
-		return 0
-	}
-
-	return id
 }
 
 func (r *request) Cancel() {

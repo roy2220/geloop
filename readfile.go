@@ -96,7 +96,7 @@ func (l *Loop) ReadFile(request1 *ReadFileRequest) int64 {
 		}
 	}
 
-	return request1.r.Submit(l)
+	return l.submitRequest(&request1.r)
 }
 
 func (r *ReadFileRequest) process() bool {
@@ -108,8 +108,9 @@ func (r *ReadFileRequest) process() bool {
 		return true
 	}
 
-	reservedBuffer := loop.readBuffer[:loop.reservedReadBufferSize]
-	buffer := loop.readBuffer[loop.reservedReadBufferSize:]
+	sharedContext := &loop.readFileSharedContext
+	reservedBuffer := sharedContext.Buffer[:sharedContext.ReservedBufferSize]
+	buffer := sharedContext.Buffer[sharedContext.ReservedBufferSize:]
 	i := 0
 
 	for {
@@ -145,12 +146,24 @@ func (r *ReadFileRequest) process() bool {
 			return true
 		}
 
-		loop.readBuffer = make([]byte, loop.reservedReadBufferSize+2*len(buffer))
-		reservedBuffer = loop.readBuffer[:loop.reservedReadBufferSize]
-		temp := loop.readBuffer[loop.reservedReadBufferSize:]
+		sharedContext.Buffer = make([]byte, sharedContext.ReservedBufferSize+2*len(buffer))
+		reservedBuffer = sharedContext.Buffer[:sharedContext.ReservedBufferSize]
+		temp := sharedContext.Buffer[sharedContext.ReservedBufferSize:]
 		copy(temp, buffer)
 		buffer = temp
 	}
+}
+
+const initialReadBufferSize = 1024
+
+type readFileSharedContext struct {
+	Buffer             []byte
+	ReservedBufferSize int
+}
+
+func (rfsc *readFileSharedContext) Init(reservedBufferSize int) {
+	rfsc.Buffer = make([]byte, reservedBufferSize+initialReadBufferSize)
+	rfsc.ReservedBufferSize = reservedBufferSize
 }
 
 func getReadFileRequest(r *request) *ReadFileRequest {

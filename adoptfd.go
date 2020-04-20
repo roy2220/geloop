@@ -65,7 +65,7 @@ func (l *Loop) AdoptFd(request1 *AdoptFdRequest) {
 		}
 	}
 
-	request1.r.Submit(l)
+	l.submitRequest(&request1.r)
 }
 
 func getAdoptFdRequest(r *request) *AdoptFdRequest {
