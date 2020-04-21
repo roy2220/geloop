@@ -26,8 +26,8 @@ func TestServer(t *testing.T) {
 			e = true
 		},
 		OnSetup: func(s *geloop.Server) { st = true },
-		OnConnection: func(s *geloop.Server, fd int) {
-			syscall.Close(fd)
+		OnConnection: func(s *geloop.Server, newFd int) {
+			syscall.Close(newFd)
 			nc++
 			if nc == N {
 				s.Remove()

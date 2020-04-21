@@ -52,8 +52,8 @@ func runEchoServer(ctx context.Context) {
 		OnSetup: func(s *geloop.Server) {
 			fmt.Printf("listening on %s ...\n", s.URL)
 		},
-		OnConnection: func(_ *geloop.Server, fd int) {
-			handleConn(lg, fd)
+		OnConnection: func(_ *geloop.Server, newFd int) {
+			handleConn(lg, newFd)
 		},
 		OnShutdown: func(s *geloop.Server) {
 			fmt.Println("exit")
