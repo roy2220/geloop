@@ -23,7 +23,8 @@ type Loop struct {
 	worker                 worker.Worker
 	workerWatch            *poller.Watch
 	isBroken               bool
-	requestRBTree          intrusive.RBTree
+	requestHashMap         intrusive.HashMap
+	requestIDBuffer        int64
 	readFileSharedContext  readFileSharedContext
 	writeFileSharedContext writeFileSharedContext
 }
@@ -35,7 +36,7 @@ func (l *Loop) Init(reservedReadBufferSize int) *Loop {
 	l.timer.Init()
 	l.worker.Init(&l.poller)
 	l.workerWatch = &(&request{OnWatch: func(*request) bool { return false }}).Watch
-	l.requestRBTree.Init(orderRequestRBTreeNode, compareRequestRBTreeNode)
+	l.requestHashMap.Init(0, hashRequestID, matchRequestHashMapNode)
 	l.readFileSharedContext.Init(reservedReadBufferSize)
 	l.writeFileSharedContext.Init()
 	return l
@@ -167,21 +168,22 @@ func (l *Loop) addTask(request *request) error {
 }
 
 func (l *Loop) addRequest(request *request) {
-	l.requestRBTree.InsertNode(&request.RBTreeNode)
+	l.requestHashMap.InsertNode(&request.HashMapNode, &request.ID)
 }
 
 func (l *Loop) removeRequest(request *request) {
-	l.requestRBTree.RemoveNode(&request.RBTreeNode)
+	l.requestHashMap.RemoveNode(&request.HashMapNode)
 }
 
 func (l *Loop) getRequest(requestID int64) (*request, bool) {
-	rbTreeNode, ok := l.requestRBTree.FindNode(requestID)
+	l.requestIDBuffer = requestID
+	hashMapNode, ok := l.requestHashMap.FindNode(&l.requestIDBuffer)
 
 	if !ok {
 		return nil, false
 	}
 
-	request := getRequest(rbTreeNode)
+	request := getRequest(hashMapNode)
 	return request, true
 }
 
@@ -272,8 +274,8 @@ func (idg *idGenerator) generateWatcherID() int64 {
 	return int64(watcherIDX2 >> 1)
 }
 
-func getRequest(rbTreeNode *intrusive.RBTreeNode) *request {
-	return (*request)(rbTreeNode.GetContainer(unsafe.Offsetof(request{}.RBTreeNode)))
+func getRequest(hashMapNode *intrusive.HashMapNode) *request {
+	return (*request)(hashMapNode.GetContainer(unsafe.Offsetof(request{}.HashMapNode)))
 }
 
 func getRequestByTask(task *worker.Task) *request {

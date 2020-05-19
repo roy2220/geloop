@@ -24,7 +24,7 @@ const (
 // Poller ...
 type Poller struct {
 	fd               int
-	watcherRBTree    intrusive.RBTree
+	watcherHashMap   intrusive.HashMap
 	dirtyWatcherList intrusive.List
 	watcherIDBuffer  int64
 	eventsBuffer     []syscall.EpollEvent
@@ -34,16 +34,16 @@ type Poller struct {
 func (p *Poller) Init() *Poller {
 	p.fd = -1
 
-	p.watcherRBTree.Init(
-		func(rbTreeNode1, rbTreeNode2 *intrusive.RBTreeNode) bool {
-			watcher1 := (*watcher)(rbTreeNode1.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
-			watcher2 := (*watcher)(rbTreeNode2.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
-			return watcher1.ID < watcher2.ID
+	p.watcherHashMap.Init(
+		0,
+
+		func(watcherID interface{}) uint64 {
+			return uint64(*watcherID.(*int64)) * 11400714819323198485
 		},
 
-		func(rbTreeNode1 *intrusive.RBTreeNode, watcherID interface{}) int64 {
-			watcher := (*watcher)(rbTreeNode1.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
-			return watcher.ID - *(watcherID.(*int64))
+		func(hashMapNode *intrusive.HashMapNode, watcherID interface{}) bool {
+			watcher := (*watcher)(hashMapNode.GetContainer(unsafe.Offsetof(watcher{}.HashMapNode)))
+			return watcher.ID == *watcherID.(*int64)
 		},
 	)
 
@@ -66,8 +66,14 @@ func (p *Poller) Open() error {
 
 // Close ...
 func (p *Poller) Close(callback func(*Watch)) error {
-	for rbTreeRoot, ok := p.watcherRBTree.GetRoot(); ok; rbTreeRoot, ok = p.watcherRBTree.GetRoot() {
-		watcher := (*watcher)(rbTreeRoot.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+	for {
+		it := p.watcherHashMap.Foreach()
+
+		if it.IsAtEnd() {
+			break
+		}
+
+		watcher := (*watcher)(it.Node().GetContainer(unsafe.Offsetof(watcher{}.HashMapNode)))
 		fd := watcher.Fd
 
 		if err := p.doCloseFd(watcher, callback); err != nil {
@@ -75,7 +81,7 @@ func (p *Poller) Close(callback func(*Watch)) error {
 		}
 	}
 
-	p.watcherRBTree = intrusive.RBTree{}
+	p.watcherHashMap = intrusive.HashMap{}
 	p.dirtyWatcherList = intrusive.List{}
 	return syscall.Close(p.fd)
 }
@@ -90,7 +96,7 @@ func (p *Poller) AdoptFd(fd int, watcherID int64) {
 		watcher.WatchLists[i].Init()
 	}
 
-	p.watcherRBTree.InsertNode(&watcher.RBTreeNode)
+	p.watcherHashMap.InsertNode(&watcher.HashMapNode, &watcher.ID)
 }
 
 // CloseFd ...
@@ -186,8 +192,8 @@ func (p *Poller) ProcessWatches(deadline time.Time, callback func(*Watch)) error
 
 		for _, event := range events {
 			p.watcherIDBuffer = eventGetWatcherID(&event)
-			rbTreeNode, _ := p.watcherRBTree.FindNode(&p.watcherIDBuffer)
-			watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+			hashMapNode, _ := p.watcherHashMap.FindNode(&p.watcherIDBuffer)
+			watcher := (*watcher)(hashMapNode.GetContainer(unsafe.Offsetof(watcher{}.HashMapNode)))
 
 			if event.Events&(syscall.EPOLLIN|syscall.EPOLLERR|syscall.EPOLLHUP) != 0 {
 				watchList.AppendNodes(&watcher.WatchLists[EventReadable-1])
@@ -214,18 +220,18 @@ func (p *Poller) ProcessWatches(deadline time.Time, callback func(*Watch)) error
 
 func (p *Poller) getWatcher(watcherID int64) (*watcher, error) {
 	p.watcherIDBuffer = watcherID
-	rbTreeNode, ok := p.watcherRBTree.FindNode(&p.watcherIDBuffer)
+	hashMapNode, ok := p.watcherHashMap.FindNode(&p.watcherIDBuffer)
 
 	if !ok {
 		return nil, ErrInvalidWatcherID
 	}
 
-	watcher := (*watcher)(rbTreeNode.GetContainer(unsafe.Offsetof(watcher{}.RBTreeNode)))
+	watcher := (*watcher)(hashMapNode.GetContainer(unsafe.Offsetof(watcher{}.HashMapNode)))
 	return watcher, nil
 }
 
 func (p *Poller) doCloseFd(watcher *watcher, callback func(*Watch)) error {
-	p.watcherRBTree.RemoveNode(&watcher.RBTreeNode)
+	p.watcherHashMap.RemoveNode(&watcher.HashMapNode)
 
 	if !watcher.DirtyListNode.IsReset() {
 		watcher.DirtyListNode.Remove()
@@ -317,7 +323,7 @@ var ErrInvalidWatcherID = errors.New("poller: invalid watcher id")
 const initialEventBufferLength = 64
 
 type watcher struct {
-	RBTreeNode        intrusive.RBTreeNode
+	HashMapNode       intrusive.HashMapNode
 	DirtyListNode     intrusive.ListNode
 	ID                int64
 	Fd                int

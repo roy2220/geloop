@@ -12,22 +12,22 @@ import (
 )
 
 type request struct {
-	RBTreeNode intrusive.RBTreeNode
-	Task       worker.Task
-	OnTask     func(r *request) (isCompleted bool)
-	Watch      poller.Watch
-	OnWatch    func(r *request) (isCompleted bool)
-	Alarm      timer.Alarm
-	OnAlarm    func(r *request) (isCompleted bool)
-	OnError    func(r *request, err error)
-	OnCleanup  func(r *request)
+	HashMapNode intrusive.HashMapNode
+	ID          int64
+	Task        worker.Task
+	OnTask      func(r *request) (isCompleted bool)
+	Watch       poller.Watch
+	OnWatch     func(r *request) (isCompleted bool)
+	Alarm       timer.Alarm
+	OnAlarm     func(r *request) (isCompleted bool)
+	OnError     func(r *request, err error)
+	OnCleanup   func(r *request)
 
-	id   int64
 	loop *Loop
 }
 
 func (r *request) Init(id int64) {
-	if !atomic.CompareAndSwapInt64(&r.id, 0, id) {
+	if !atomic.CompareAndSwapInt64(&r.ID, 0, id) {
 		panic(errRequestInProcess)
 	}
 }
@@ -102,17 +102,15 @@ func (r *request) remove() {
 }
 
 func (r *request) release() {
-	atomic.StoreInt64(&r.id, 0)
+	atomic.StoreInt64(&r.ID, 0)
 	r.OnCleanup(r)
 }
 
-func orderRequestRBTreeNode(rbTreeNode1, rbTreeNode2 *intrusive.RBTreeNode) bool {
-	request1 := getRequest(rbTreeNode1)
-	request2 := getRequest(rbTreeNode2)
-	return request1.id < request2.id
+func hashRequestID(requestID interface{}) uint64 {
+	return uint64(*requestID.(*int64)) * 11400714819323198485
 }
 
-func compareRequestRBTreeNode(rbTreeNode *intrusive.RBTreeNode, requestID interface{}) int64 {
-	request := getRequest(rbTreeNode)
-	return int64(request.id - requestID.(int64))
+func matchRequestHashMapNode(hashMapNode *intrusive.HashMapNode, requestID interface{}) bool {
+	request := getRequest(hashMapNode)
+	return request.ID == *requestID.(*int64)
 }
